@@ -6,7 +6,7 @@ import unicodedata
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -15,15 +15,9 @@ import streamlit as st
 
 
 # ============================================================
-# FRANCHISE STATION P&L APP - ADMIN UPLOAD + USER DASHBOARD
+# FRANCHISE STATION P&L APP
+# Admin-only multi-source upload + one-time mapping wizard
 # ============================================================
-# Mantık:
-# 1) Dosyaları sadece admin yükler.
-# 2) Admin farklı kaynak dosyalarını yükler: ZSD50/ZSD50G, Dealer List,
-#    FBL3N, Discount Premium, Rebate, ATS, Amortization, manuel P&L vb.
-# 3) Uygulama bu dosyaları ortak uzun formata çevirir.
-# 4) Hesaplanan P&L satırlarını üretir ve tek master raporu kaydeder.
-# 5) Normal kullanıcı sadece son güncellenmiş dashboard/raporu görür.
 
 st.set_page_config(
     page_title="Franchise Station P&L",
@@ -33,11 +27,10 @@ st.set_page_config(
 )
 
 DATA_DIR = Path("pnl_app_data")
-UPLOAD_DIR = DATA_DIR / "uploaded_sources"
-MASTER_FILE = DATA_DIR / "master_pnl_report.pkl"
-MANIFEST_FILE = DATA_DIR / "manifest.json"
 DATA_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
+MASTER_FILE = DATA_DIR / "master_pnl_report.pkl"
+MAPPING_FILE = DATA_DIR / "mapping_config.json"
+MANIFEST_FILE = DATA_DIR / "manifest.json"
 
 try:
     ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin123")
@@ -58,13 +51,10 @@ SOURCE_TYPES = [
 
 PERIOD_LEVELS = ["Senelik", "Çeyreklik", "Aylık", "Haftalık", "Günlük"]
 CURRENCY_OPTIONS = ["TL", "USD"]
-SIGN_MODES = [
-    "Dosyadaki işaretleri koru",
-    "Tip bazlı otomatik işaret ver",
-]
+SIGN_MODES = ["Dosyadaki işaretleri koru", "Tip bazlı otomatik işaret ver"]
 
 # ------------------------------------------------------------
-# P&L metadata and formulas
+# P&L line metadata
 # ------------------------------------------------------------
 
 INFO_COLS = [
@@ -96,6 +86,7 @@ DASHBOARD_FILTERS = [
     ("Name", "Bayi / İstasyon Adı"),
 ]
 
+# Keep this close to the P&L structure shared by the user.
 LINE_INFO: Dict[str, Dict[str, str]] = {
     "Fuel Volume": {"type": "Volumes", "source": "ZSD50 & ZSD50G"},
     "Gas Volume": {"type": "Volumes", "source": "ZSD50 & ZSD50G"},
@@ -114,6 +105,7 @@ LINE_INFO: Dict[str, Dict[str, str]] = {
     "Fuel COGS": {"type": "Costs", "source": "ZSD50 & ZSD50G"},
     "Gas COGS": {"type": "Costs", "source": "ZSD50 & ZSD50G"},
     "COGS Total": {"type": "Costs", "source": "ZSD50 & ZSD50G"},
+    "Gross Margin": {"type": "Calculated Area", "source": "Calculated"},
     "Fuel Variable Process Expenses All": {"type": "Expenses", "source": "FBL3N Direct Variable"},
     "Fuel Variable Logistic Expenses": {"type": "Expenses", "source": "FBL3N Direct Variable"},
     "Transport Income fuel only": {"type": "Incomes", "source": "FBL3N Direct Variable"},
@@ -148,11 +140,10 @@ LINE_INFO: Dict[str, Dict[str, str]] = {
     "Market Commission Income": {"type": "Incomes", "source": "FBL3N Income"},
     "Penalty Charge": {"type": "Incomes", "source": "FBL3N Income"},
     "EMRA Fee All": {"type": "Incomes", "source": "FBL3N Income"},
-    "Tangible_Total": {"type": "Amortization", "source": "Accounting Department Fuel Reports"},
-    "Intangible_Total": {"type": "Amortization", "source": "Accounting Department Gas Reports"},
-    "Working Capital Cost": {"type": "Expenses", "source": "Manual / Calculated"},
-    # Calculated lines
-    "Gross Margin": {"type": "Calculated Area", "source": "Calculated"},
+    "Tangible_Total": {"type": "Amortization", "source": "Amortization"},
+    "Intangible_Total": {"type": "Amortization", "source": "Amortization"},
+    "Net Income": {"type": "Calculated Area", "source": "Calculated"},
+    "EBITDA": {"type": "Calculated Area", "source": "Calculated"},
     "Card Expenses/Incomes": {"type": "Calculated Area", "source": "Calculated"},
     "Rent Expenses/Incomes": {"type": "Calculated Area", "source": "Calculated"},
     "Engineering Expenses": {"type": "Calculated Area", "source": "Calculated"},
@@ -163,93 +154,17 @@ LINE_INFO: Dict[str, Dict[str, str]] = {
     "Process & Logistic Variable Expenses-Level OP1": {"type": "Calculated Area", "source": "Calculated"},
     "Terminal costs -Level OP2": {"type": "Calculated Area", "source": "Calculated"},
     "Direct Expenses From Related Departments-Level OP3": {"type": "Calculated Area", "source": "Calculated"},
-    "EBITDA": {"type": "Calculated Area", "source": "Calculated"},
-    "Net Income": {"type": "Calculated Area", "source": "Calculated"},
+    "Working Capital Cost": {"type": "Expenses", "source": "Working Capital"},
     "Net Income-Working Capital Cost": {"type": "Calculated Area", "source": "Calculated"},
-    "Margin Share-Diesel-Old": {"type": "Calculated Area", "source": "Calculated / Manual"},
-    "Margin Share-Diesel-New": {"type": "Calculated Area", "source": "Calculated / Manual"},
-    "Margin Share-Gasoline-Old": {"type": "Calculated Area", "source": "Calculated / Manual"},
-    "Margin Share-Gasoline-New": {"type": "Calculated Area", "source": "Calculated / Manual"},
+    "Margin Share-Diesel-Old": {"type": "Calculated Area", "source": "Margin Share"},
+    "Margin Share-Diesel-New": {"type": "Calculated Area", "source": "Margin Share"},
+    "Margin Share-Gasoline-Old": {"type": "Calculated Area", "source": "Margin Share"},
+    "Margin Share-Gasoline-New": {"type": "Calculated Area", "source": "Margin Share"},
 }
 
-CALCULATED_LINES = {
-    line for line, meta in LINE_INFO.items() if meta.get("type") == "Calculated Area"
-}
-
-PNL_ORDER = [
-    "Volume Total",
-    "Fuel Volume",
-    "Gas Volume",
-    "Gross Sales Total",
-    "Fuel Gross Sales",
-    "Gas Gross Sales",
-    "Discount Included in Invoice Total",
-    "Discount Premium",
-    "Rebate",
-    "Additive",
-    "ATS Commision Fee",
-    "ATS Discount",
-    "ATS Income",
-    "ATS Disc given to Customers",
-    "COGS Total",
-    "Fuel COGS",
-    "Gas COGS",
-    "Gross Margin",
-    "Fuel Variable Process Expenses All",
-    "Fuel Variable Logistic Expenses",
-    "Transport Income fuel only",
-    "Autogas Variable Logistic Expenses",
-    "Process & Logistic Variable Expenses",
-    "Process & Logistic Variable Expenses-Level OP1",
-    "TESİS/TERMINALS",
-    "Terminal costs -Level OP2",
-    "BAYİLİK SATIŞLARI/DEALERSHIP SALES",
-    "ATS SATIŞLARI/VIS SALES",
-    "KURUMSAL İLETİŞİM/CORPORATE COMMUNI",
-    "PAZARLAMA/MARKETING",
-    "SATIŞ DESTEK/SALES SUPPORT",
-    "OTOMASYON/AUTOMATION",
-    "MÜHENDİSLİK/ENGINEERING",
-    "Direct Expenses From Related Departments-Level OP3",
-    "Loyalty Card Expenses",
-    "Card Cost All",
-    "Cards Income",
-    "Card Expenses/Incomes",
-    "Rent",
-    "Rent Income",
-    "Rent Expenses/Incomes",
-    "Engineering Expenses All",
-    "Engineering Expenses",
-    "MUHASEBE/ACCOUNTING",
-    "İDARİ İŞLER/ADMINISTRATIVE",
-    "İNSAN KAYNAKLARI/HR",
-    "BİLGİ İŞLEM/IT",
-    "GENEL YÖNETİM/GENERAL ADMIN",
-    "OFİS/OFFICE",
-    "İKMAL/SUPPLY",
-    "SEÇ-G/HSSE",
-    "HUKUK/LEGAL",
-    "Indirect Expenses From Unrelated Departments",
-    "Gain on sale of fixed assets All",
-    "Insurance Income All",
-    "Late Payment Charges All",
-    "Price Difference All",
-    "Market Commission Income",
-    "Penalty Charge",
-    "EMRA Fee All",
-    "Incomes Total",
-    "EBITDA",
-    "Tangible_Total",
-    "Intangible_Total",
-    "Amortizations",
-    "Net Income",
-    "Working Capital Cost",
-    "Net Income-Working Capital Cost",
-    "Margin Share-Diesel-Old",
-    "Margin Share-Diesel-New",
-    "Margin Share-Gasoline-Old",
-    "Margin Share-Gasoline-New",
-]
+P_AND_L_LINES = list(LINE_INFO.keys())
+INPUT_LINES = [line for line, info in LINE_INFO.items() if info["source"] != "Calculated"]
+CALCULATED_LINES = [line for line, info in LINE_INFO.items() if info["source"] == "Calculated"]
 
 SUMMARY_LINES = [
     "Volume Total",
@@ -265,22 +180,24 @@ SUMMARY_LINES = [
     "Net Income-Working Capital Cost",
 ]
 
+PNL_ORDER = P_AND_L_LINES
+
 INFO_ALIASES = {
     "Year_Month_Quarter": ["Year_Month_Quarter", "Year Month Quarter", "YearMonthQuarter"],
-    "Year": ["Year", "Yıl", "Yil"],
+    "Year": ["Year", "Yıl", "Yil", "Fiscal Year", "Calendar Year"],
     "Quarter": ["Quarter", "Çeyrek", "Ceyrek"],
-    "Month": ["Month", "Ay"],
-    "Date": ["Date", "Tarih", "Posting Date", "Document Date", "Fatura Tarihi"],
+    "Month": ["Month", "Ay", "Posting Period", "Period"],
+    "Date": ["Date", "Tarih", "Posting Date", "Document Date", "Fatura Tarihi", "Billing Date", "Invoice Date"],
     "Contract Beginning": ["Contract Beginning", "Contract_Beginning"],
     "Contract Expiration": ["Contract Expiration", "Contract_Expiration"],
-    "İstasyon": ["İstasyon", "Istasyon", "Station", "Station Code", "Station_Code", "Bayi Kodu", "Bayi"],
-    "Name": ["Name", "Station Name", "Station_Name", "Bayi Adı", "Bayi Adi", "Dealer Name"],
+    "İstasyon": ["İstasyon", "Istasyon", "Station", "Station Code", "Station_Code", "Bayi Kodu", "Bayi", "Customer", "Müşteri", "Musteri"],
+    "Name": ["Name", "Station Name", "Station_Name", "Bayi Adı", "Bayi Adi", "Dealer Name", "Customer Name"],
     "District": ["District", "İlçe", "Ilce"],
     "City": ["City", "Şehir", "Sehir", "İl", "Il"],
     "Territory": ["Territory", "Region", "Bölge", "Bolge"],
     "Territory Manager": ["Territory Manager", "Territory_Manager", "Bölge Müdürü", "Bolge Muduru"],
     "Area Sales Manager": ["Area Sales Manager", "Area_Sales_Manager", "ASM", "Satış Temsilcisi", "Satis Temsilcisi"],
-    "Dealer/Acenta": ["Dealer/Acenta", "Dealer_Acenta", "Dealer", "Acenta", "Bayi Tipi", "Dealer or Agency"],
+    "Dealer/Acenta": ["Dealer/Acenta", "Dealer_Acenta", "Dealer", "Acenta", "Bayi Tipi", "Dealer or Agency", "Counterparty"],
     "Supply city for fuel": ["Supply city for fuel", "Supply_city_for_fuel", "Supply City", "İkmal Şehri", "Ikmal Sehri"],
 }
 
@@ -289,10 +206,16 @@ EXTRA_LINE_ALIASES = {
     "volume total": "Volume Total",
     "fuel volume": "Fuel Volume",
     "gas volume": "Gas Volume",
-    "gross sales": "Gross Sales Total",
-    "gross sales total": "Gross Sales Total",
     "fuel gross sales": "Fuel Gross Sales",
     "gas gross sales": "Gas Gross Sales",
+    "gross sales": "Gross Sales Total",
+    "gross sales total": "Gross Sales Total",
+    "sales price": "Gross Sales Total",
+    "satis fiyati": "Gross Sales Total",
+    "tl net deger": "Gross Sales Total",
+    "net deger": "Gross Sales Total",
+    "discount": "Discount Included in Invoice Total",
+    "indirim": "Discount Included in Invoice Total",
     "cogs": "COGS Total",
     "cogs total": "COGS Total",
     "fuel cogs": "Fuel COGS",
@@ -300,7 +223,6 @@ EXTRA_LINE_ALIASES = {
     "gross margin": "Gross Margin",
     "ebitda": "EBITDA",
     "net income": "Net Income",
-    "net_income": "Net Income",
     "net income working capital cost": "Net Income-Working Capital Cost",
     "net income-working capital cost": "Net Income-Working Capital Cost",
     "working capital cost": "Working Capital Cost",
@@ -310,8 +232,6 @@ EXTRA_LINE_ALIASES = {
     "ats commision fee": "ATS Commision Fee",
     "cards income": "Cards Income",
     "card income": "Cards Income",
-    "rent expenses incomes": "Rent Expenses/Incomes",
-    "card expenses incomes": "Card Expenses/Incomes",
 }
 
 ACCOUNT_TO_LINE = {
@@ -364,11 +284,10 @@ DEPARTMENT_KEYWORDS = {
     "terminal": "TESİS/TERMINALS",
     "tesis": "TESİS/TERMINALS",
     "hsse": "SEÇ-G/HSSE",
-    "sec-g": "SEÇ-G/HSSE",
+    "sec g": "SEÇ-G/HSSE",
     "legal": "HUKUK/LEGAL",
     "hukuk": "HUKUK/LEGAL",
 }
-
 
 # ------------------------------------------------------------
 # Utility functions
@@ -379,36 +298,33 @@ def normalize_key(value: object) -> str:
     text = text.strip()
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = text.lower()
-    text = text.replace("ı", "i")
+    text = text.lower().replace("ı", "i")
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def build_alias_map() -> Dict[str, str]:
-    alias_map: Dict[str, str] = {}
+    result: Dict[str, str] = {}
     for canonical, aliases in INFO_ALIASES.items():
-        alias_map[normalize_key(canonical)] = canonical
+        result[normalize_key(canonical)] = canonical
         for alias in aliases:
-            alias_map[normalize_key(alias)] = canonical
-    return alias_map
-
-
-INFO_ALIAS_MAP = build_alias_map()
+            result[normalize_key(alias)] = canonical
+    return result
 
 
 def build_line_alias_map() -> Dict[str, str]:
-    alias_map: Dict[str, str] = {}
+    result: Dict[str, str] = {}
     for line in LINE_INFO:
-        alias_map[normalize_key(line)] = line
-        alias_map[normalize_key(line.replace("_", " "))] = line
-        alias_map[normalize_key(line.replace("/", " "))] = line
-        alias_map[normalize_key(line.replace("-", " "))] = line
+        result[normalize_key(line)] = line
+        result[normalize_key(line.replace("_", " "))] = line
+        result[normalize_key(line.replace("/", " "))] = line
+        result[normalize_key(line.replace("-", " "))] = line
     for alias, canonical in EXTRA_LINE_ALIASES.items():
-        alias_map[normalize_key(alias)] = canonical
-    return alias_map
+        result[normalize_key(alias)] = canonical
+    return result
 
 
+INFO_ALIAS_MAP = build_alias_map()
 LINE_ALIAS_MAP = build_line_alias_map()
 
 
@@ -431,14 +347,31 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     s = s.str.replace("\u00a0", "", regex=False)
     s = s.str.replace(" ", "", regex=False)
+    s = s.str.replace("−", "-", regex=False)
 
-    # Handle European format: 1.234.567,89
-    euro_mask = s.str.contains(r"\.\d{3}", regex=True) & s.str.contains(",", regex=False)
+    # Parentheses as negative: (1,234.56)
+    neg_mask = s.str.match(r"^\(.*\)$", na=False)
+    s = s.str.replace("(", "", regex=False).str.replace(")", "", regex=False)
+
+    # European number format: 1.234.567,89
+    euro_mask = s.str.contains(r"\.\d{3}", regex=True, na=False) & s.str.contains(",", regex=False, na=False)
     s = s.where(~euro_mask, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-    # Handle simple comma decimal
     s = s.where(euro_mask, s.str.replace(",", ".", regex=False))
 
-    return pd.to_numeric(s, errors="coerce")
+    out = pd.to_numeric(s, errors="coerce")
+    out = out.where(~neg_mask, -out.abs())
+    return out
+
+
+def blank_to_na(series: pd.Series) -> pd.Series:
+    return series.replace(["", "nan", "NaN", "None", "<NA>", "NaT"], np.nan)
+
+
+def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
+    if col not in df.columns:
+        return []
+    values = blank_to_na(df[col].astype(str).str.strip()).dropna().unique().tolist()
+    return sorted(values)
 
 
 def first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -450,11 +383,29 @@ def first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[s
     return None
 
 
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    result.columns = [resolve_info_col(c) for c in result.columns]
-    result.columns = [str(c).strip() for c in result.columns]
+def dedupe_columns(columns: List[Any]) -> List[str]:
+    result = []
+    counts: Dict[str, int] = {}
+    for i, col in enumerate(columns):
+        base = str(col).strip() if pd.notna(col) and str(col).strip() else f"Column_{i+1}"
+        base = base.replace("\n", " ").strip()
+        if base.lower().startswith("unnamed"):
+            base = f"Column_{i+1}"
+        count = counts.get(base, 0)
+        if count:
+            new_col = f"{base}_{count+1}"
+        else:
+            new_col = base
+        counts[base] = count + 1
+        result.append(new_col)
     return result
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [resolve_info_col(c) for c in out.columns]
+    out.columns = dedupe_columns(list(out.columns))
+    return out
 
 
 def detect_currency_from_text(value: object, default_currency: str) -> str:
@@ -468,12 +419,12 @@ def detect_currency_from_text(value: object, default_currency: str) -> str:
 
 def detect_product_from_text(value: object) -> str:
     text = normalize_key(value)
-    if "gasoline" in text or "benzin" in text:
-        return "Gasoline"
-    if "diesel" in text or "motorin" in text or "fuel" in text:
-        return "Fuel"
-    if "lpg" in text or "autogas" in text or "gas" in text:
+    if any(x in text for x in ["lpg", "autogas", "otogaz", "gaz"]):
         return "Gas"
+    if any(x in text for x in ["gasoline", "benzin"]):
+        return "Fuel"
+    if any(x in text for x in ["diesel", "motorin", "fuel"]):
+        return "Fuel"
     if "total" in text:
         return "Total"
     return "Total"
@@ -491,106 +442,17 @@ def sign_for_line(line: str) -> int:
 
 
 def apply_sign_policy(df: pd.DataFrame, sign_mode: str) -> pd.DataFrame:
-    result = df.copy()
-    result["Value"] = coerce_numeric(result["Value"]).fillna(0.0)
+    out = df.copy()
+    out["Value"] = coerce_numeric(out["Value"]).fillna(0.0)
     if sign_mode == "Tip bazlı otomatik işaret ver":
-        result["Value"] = result.apply(
-            lambda r: abs(float(r["Value"])) * sign_for_line(str(r["P&L Line"])),
-            axis=1,
-        )
-    return result
+        out["Value"] = out.apply(lambda r: abs(float(r["Value"])) * sign_for_line(str(r["P&L Line"])), axis=1)
+    return out
 
 
-def parse_period_columns(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-
-    if "Date" in result.columns:
-        result["Date"] = pd.to_datetime(result["Date"], errors="coerce", dayfirst=True)
-    else:
-        result["Date"] = pd.NaT
-
-    if "Year_Month_Quarter" in result.columns:
-        extracted = result["Year_Month_Quarter"].astype(str).str.extract(
-            r"(?P<Year>\d{4})[-_/ ]*Q(?P<QuarterNo>\d{1})[-_/ ]*(?P<Month>\d{1,2})"
-        )
-        if "Year" not in result.columns:
-            result["Year"] = pd.to_numeric(extracted["Year"], errors="coerce")
-        else:
-            result["Year"] = pd.to_numeric(result["Year"], errors="coerce").fillna(
-                pd.to_numeric(extracted["Year"], errors="coerce")
-            )
-        if "Month" not in result.columns:
-            result["Month"] = pd.to_numeric(extracted["Month"], errors="coerce")
-        else:
-            result["Month"] = pd.to_numeric(result["Month"], errors="coerce").fillna(
-                pd.to_numeric(extracted["Month"], errors="coerce")
-            )
-
-    if "Year" in result.columns:
-        result["Year"] = pd.to_numeric(result["Year"], errors="coerce")
-    else:
-        result["Year"] = result["Date"].dt.year
-
-    if "Month" in result.columns:
-        result["Month"] = pd.to_numeric(result["Month"], errors="coerce")
-    else:
-        result["Month"] = result["Date"].dt.month
-
-    # If Date is missing but Year/Month exists, create first day of month.
-    missing_date = result["Date"].isna()
-    if missing_date.any():
-        tmp_year = result["Year"].fillna(datetime.now().year).astype(int)
-        tmp_month = result["Month"].fillna(1).astype(int)
-        fallback_date = pd.to_datetime(
-            {"year": tmp_year, "month": tmp_month, "day": 1},
-            errors="coerce",
-        )
-        result.loc[missing_date, "Date"] = fallback_date.loc[missing_date]
-
-    if "Quarter" not in result.columns:
-        result["Quarter"] = "Q" + result["Date"].dt.quarter.astype("Int64").astype(str)
-    else:
-        result["Quarter"] = result["Quarter"].astype(str).str.replace(".0", "", regex=False)
-        result["Quarter"] = np.where(
-            result["Quarter"].str.upper().str.startswith("Q"),
-            result["Quarter"],
-            "Q" + result["Quarter"],
-        )
-
-    result["Year"] = result["Date"].dt.year.astype("Int64")
-    result["Month"] = result["Date"].dt.month.astype("Int64")
-    result["Month_Label"] = result["Date"].dt.strftime("%Y-%m")
-    result["Quarter_Label"] = result["Date"].dt.year.astype("Int64").astype(str) + "-Q" + result["Date"].dt.quarter.astype("Int64").astype(str)
-    result["Year_Label"] = result["Date"].dt.year.astype("Int64").astype(str)
-    iso = result["Date"].dt.isocalendar()
-    result["Week_Label"] = iso.year.astype(str) + "-W" + iso.week.astype(str).str.zfill(2)
-    result["Day_Label"] = result["Date"].dt.strftime("%Y-%m-%d")
-    result["Year_Month_Quarter"] = result["Year"].astype(str) + "-Q" + result["Date"].dt.quarter.astype(str) + "-" + result["Month"].astype(str)
-    return result
-
-
-def selected_period_column(df: pd.DataFrame, period_level: str) -> Tuple[pd.DataFrame, str]:
-    result = df.copy()
-    col = {
-        "Senelik": "Year_Label",
-        "Çeyreklik": "Quarter_Label",
-        "Aylık": "Month_Label",
-        "Haftalık": "Week_Label",
-        "Günlük": "Day_Label",
-    }.get(period_level, "Month_Label")
-    result["Selected_Period"] = result[col].astype(str)
-    return result, "Selected_Period"
-
-
-def blank_to_na(series: pd.Series) -> pd.Series:
-    return series.replace(["", "nan", "NaN", "None", "<NA>", "NaT"], np.nan)
-
-
-def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
-    if col not in df.columns:
-        return []
-    values = blank_to_na(df[col].astype(str).str.strip()).dropna().unique().tolist()
-    return sorted(values)
+def safe_get_wide(wide: pd.DataFrame, line: str) -> pd.Series:
+    if line in wide.columns:
+        return pd.to_numeric(wide[line], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=wide.index)
 
 
 def format_money(value: float, currency: str) -> str:
@@ -619,8 +481,21 @@ def format_per_volume(value: float, currency: str) -> str:
     return f"{symbol}{value:,.4f}"
 
 
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 # ------------------------------------------------------------
-# File reading
+# Reading uploaded files with selectable header row
 # ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
@@ -629,60 +504,242 @@ def get_excel_sheets(file_bytes: bytes) -> List[str]:
 
 
 @st.cache_data(show_spinner=False)
-def read_excel_cached(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+def read_excel_raw(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None)
 
 
 @st.cache_data(show_spinner=False)
-def read_csv_cached(file_bytes: bytes) -> pd.DataFrame:
+def read_csv_raw(file_bytes: bytes) -> pd.DataFrame:
     encodings = ["utf-8-sig", "utf-8", "cp1254", "latin1"]
     last_error: Optional[Exception] = None
     for enc in encodings:
         try:
-            return pd.read_csv(BytesIO(file_bytes), encoding=enc)
+            return pd.read_csv(BytesIO(file_bytes), encoding=enc, header=None)
         except Exception as exc:
             last_error = exc
     raise last_error or ValueError("CSV okunamadı")
 
 
-def read_uploaded_dataframe(file, sheet_name: Optional[str]) -> pd.DataFrame:
-    name = file.name.lower()
+def read_uploaded_raw(file, sheet_name: Optional[str]) -> pd.DataFrame:
     file_bytes = file.getvalue()
+    name = file.name.lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
-        return read_excel_cached(file_bytes, sheet_name or get_excel_sheets(file_bytes)[0])
+        sheets = get_excel_sheets(file_bytes)
+        return read_excel_raw(file_bytes, sheet_name or sheets[0])
     if name.endswith(".csv"):
-        return read_csv_cached(file_bytes)
-    raise ValueError("Sadece CSV veya Excel dosyası destekleniyor.")
+        return read_csv_raw(file_bytes)
+    raise ValueError("Sadece Excel veya CSV dosyası destekleniyor.")
+
+
+def make_dataframe_from_header(raw: pd.DataFrame, header_row: int) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    header_row = max(0, min(int(header_row), len(raw) - 1))
+    columns = dedupe_columns(raw.iloc[header_row].tolist())
+    df = raw.iloc[header_row + 1 :].copy()
+    df.columns = columns
+    df = df.dropna(how="all")
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Column_\d+$") | df.notna().any(axis=0).values]
+    return standardize_columns(df)
+
+
+def guess_header_row(raw: pd.DataFrame, max_rows: int = 20) -> int:
+    known_keywords = [
+        "product", "ürün", "urun", "malzeme", "tanim", "tanım", "net", "deger", "değer",
+        "satis", "satış", "indirim", "station", "istasyon", "counterparty", "ftrl", "miktar",
+        "year", "month", "quarter", "city", "territory", "name",
+    ]
+    best_row = 0
+    best_score = -1
+    for idx in range(min(len(raw), max_rows)):
+        values = raw.iloc[idx].dropna().astype(str).tolist()
+        row_text = " ".join(values)
+        norm = normalize_key(row_text)
+        keyword_score = sum(1 for kw in known_keywords if normalize_key(kw) in norm)
+        non_empty_score = len(values) / max(1, raw.shape[1])
+        unique_score = len(set(values)) / max(1, len(values)) if values else 0
+        score = keyword_score * 10 + non_empty_score * 3 + unique_score
+        if score > best_score:
+            best_score = score
+            best_row = idx
+    return best_row
 
 
 # ------------------------------------------------------------
-# Normalization from many source files into one P&L long table
+# Period parsing and enrichment
+# ------------------------------------------------------------
+
+def parse_period_columns(df: pd.DataFrame, default_year: Optional[int] = None, default_month: Optional[int] = None) -> pd.DataFrame:
+    out = df.copy()
+
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
+    else:
+        out["Date"] = pd.NaT
+
+    if "Year_Month_Quarter" in out.columns:
+        extracted = out["Year_Month_Quarter"].astype(str).str.extract(
+            r"(?P<Year>\d{4})[-_/ ]*Q(?P<QuarterNo>\d{1})[-_/ ]*(?P<Month>\d{1,2})"
+        )
+        if "Year" not in out.columns:
+            out["Year"] = pd.to_numeric(extracted["Year"], errors="coerce")
+        else:
+            out["Year"] = pd.to_numeric(out["Year"], errors="coerce").fillna(pd.to_numeric(extracted["Year"], errors="coerce"))
+        if "Month" not in out.columns:
+            out["Month"] = pd.to_numeric(extracted["Month"], errors="coerce")
+        else:
+            out["Month"] = pd.to_numeric(out["Month"], errors="coerce").fillna(pd.to_numeric(extracted["Month"], errors="coerce"))
+
+    if "Year" in out.columns:
+        out["Year"] = pd.to_numeric(out["Year"], errors="coerce")
+    else:
+        out["Year"] = out["Date"].dt.year
+
+    if "Month" in out.columns:
+        out["Month"] = pd.to_numeric(out["Month"], errors="coerce")
+    else:
+        out["Month"] = out["Date"].dt.month
+
+    if default_year:
+        out["Year"] = out["Year"].fillna(default_year)
+    if default_month:
+        out["Month"] = out["Month"].fillna(default_month)
+
+    missing_date = out["Date"].isna()
+    if missing_date.any():
+        year = out["Year"].fillna(default_year or datetime.now().year).astype(int)
+        month = out["Month"].fillna(default_month or 1).astype(int)
+        fallback = pd.to_datetime({"year": year, "month": month, "day": 1}, errors="coerce")
+        out.loc[missing_date, "Date"] = fallback.loc[missing_date]
+
+    if "Quarter" not in out.columns:
+        out["Quarter"] = "Q" + out["Date"].dt.quarter.astype("Int64").astype(str)
+    else:
+        q = out["Quarter"].astype(str).str.replace(".0", "", regex=False).str.strip()
+        out["Quarter"] = np.where(q.str.upper().str.startswith("Q"), q, "Q" + q)
+
+    out["Year"] = out["Date"].dt.year.astype("Int64")
+    out["Month"] = out["Date"].dt.month.astype("Int64")
+    out["Month_Label"] = out["Date"].dt.strftime("%Y-%m")
+    out["Quarter_Label"] = out["Date"].dt.year.astype("Int64").astype(str) + "-Q" + out["Date"].dt.quarter.astype("Int64").astype(str)
+    out["Year_Label"] = out["Date"].dt.year.astype("Int64").astype(str)
+    iso = out["Date"].dt.isocalendar()
+    out["Week_Label"] = iso.year.astype(str) + "-W" + iso.week.astype(str).str.zfill(2)
+    out["Day_Label"] = out["Date"].dt.strftime("%Y-%m-%d")
+    out["Year_Month_Quarter"] = out["Year"].astype(str) + "-Q" + out["Date"].dt.quarter.astype(str) + "-" + out["Month"].astype(str)
+    return out
+
+
+def selected_period_column(df: pd.DataFrame, period_level: str) -> Tuple[pd.DataFrame, str]:
+    out = df.copy()
+    col = {
+        "Senelik": "Year_Label",
+        "Çeyreklik": "Quarter_Label",
+        "Aylık": "Month_Label",
+        "Haftalık": "Week_Label",
+        "Günlük": "Day_Label",
+    }.get(period_level, "Month_Label")
+    out["Selected_Period"] = out[col].astype(str)
+    return out, "Selected_Period"
+
+
+# ------------------------------------------------------------
+# Mapping helpers
 # ------------------------------------------------------------
 
 def make_empty_long() -> pd.DataFrame:
-    cols = INFO_COLS + [
-        "Currency",
-        "Product",
-        "P&L Line",
-        "P&L Type",
-        "Value",
-        "Source Type",
-        "Source File",
-        "Is Calculated",
-    ]
+    cols = INFO_COLS + ["Currency", "Product", "P&L Line", "P&L Type", "Value", "Source Type", "Source File", "Is Calculated"]
     return pd.DataFrame(columns=cols)
 
 
-def normalize_dealer_master(raw_df: pd.DataFrame) -> pd.DataFrame:
-    df = standardize_columns(raw_df)
-    keep = [c for c in INFO_COLS if c in df.columns and c not in ["Date", "Year", "Quarter", "Month", "Year_Month_Quarter"]]
-    if "İstasyon" not in keep and "Name" not in keep:
+def options_with_none(columns: List[str]) -> List[str]:
+    return ["— seçilmedi —"] + list(columns)
+
+
+def select_default(columns: List[str], saved: Optional[str] = None, candidates: Optional[List[str]] = None) -> int:
+    opts = options_with_none(columns)
+    if saved and saved in columns:
+        return opts.index(saved)
+    if candidates:
+        lookup = {normalize_key(c): c for c in columns}
+        for cand in candidates:
+            key = normalize_key(cand)
+            if key in lookup:
+                return opts.index(lookup[key])
+    return 0
+
+
+def clean_selected(value: str) -> Optional[str]:
+    return None if value == "— seçilmedi —" else value
+
+
+def guess_mapping_for_source(source_type: str, columns: List[str]) -> Dict[str, Any]:
+    lookup = {normalize_key(c): c for c in columns}
+
+    def first(cands: List[str]) -> Optional[str]:
+        for cand in cands:
+            key = normalize_key(cand)
+            if key in lookup:
+                return lookup[key]
+        return None
+
+    mapping: Dict[str, Any] = {
+        "mode": "Kolon mapping / wide source",
+        "info_map": {},
+        "line_map": {},
+        "smart_map": {},
+        "long_line_col": None,
+        "long_value_col": None,
+        "product_col": first(["Product", "Ürün", "Urun", "Ürün Açıklaması", "Product Group"]),
+        "currency_col": first(["Currency", "Currency_Type", "Para Birimi", "PB"]),
+        "default_year": datetime.now().year,
+        "default_month": datetime.now().month,
+    }
+
+    for info in INFO_COLS:
+        candidates = INFO_ALIASES.get(info, []) + [info]
+        mapping["info_map"][info] = first(candidates)
+
+    if "ZSD50" in source_type:
+        mapping["product_col"] = first(["Product", "Ürün Açıklaması", "Urun Aciklamasi", "Ürün", "Malzeme", "Tanım", "Tanim"])
+        mapping["smart_map"] = {
+            "Volume by product": first(["Ftrl.mkt.", "Ftrl mkt", "Miktar", "Invoice Quantity", "Billing Quantity", "Net ağırlık", "Net agirlik"]),
+            "Gross Sales by product": first(["Satış Fiyatı", "Satis Fiyati", "Gross Sales", "TL-Net Değer", "TL Net Deger", "Net Değer", "Net Deger"]),
+            "COGS by product": first(["Maliyet", "COGS", "Cost", "Akpet Fuel Cost", "Akpet Gas Cost"]),
+        }
+        mapping["line_map"] = {
+            "Discount Included in Invoice Total": first(["İndirim", "Indirim", "Discount"]),
+            "Additive": first(["Katkı,Opr.", "Katki Opr", "Katkı", "Katki", "Additive"]),
+        }
+
+    return mapping
+
+
+def normalize_dealer_master(df: pd.DataFrame, mapping: Dict[str, Any]) -> pd.DataFrame:
+    info_map = mapping.get("info_map", {})
+    out = pd.DataFrame()
+    for canonical, source_col in info_map.items():
+        if canonical in ["Date", "Year", "Quarter", "Month", "Year_Month_Quarter"]:
+            continue
+        if source_col and source_col in df.columns:
+            out[canonical] = df[source_col]
+    if "İstasyon" not in out.columns and "Name" not in out.columns:
         return pd.DataFrame()
-    dealer = df[keep].copy()
-    for col in dealer.columns:
-        dealer[col] = dealer[col].astype(str).str.strip()
-    dealer = dealer.drop_duplicates(subset=[c for c in ["İstasyon", "Name"] if c in dealer.columns])
-    return dealer
+    for col in out.columns:
+        out[col] = out[col].astype(str).str.strip()
+    keys = [c for c in ["İstasyon", "Name"] if c in out.columns]
+    return out.drop_duplicates(subset=keys) if keys else out.drop_duplicates()
+
+
+def classify_smart_product_line(base: str, product_value: object) -> str:
+    product = detect_product_from_text(product_value)
+    if base == "Volume by product":
+        return "Gas Volume" if product == "Gas" else "Fuel Volume"
+    if base == "Gross Sales by product":
+        return "Gas Gross Sales" if product == "Gas" else "Fuel Gross Sales"
+    if base == "COGS by product":
+        return "Gas COGS" if product == "Gas" else "Fuel COGS"
+    return base
 
 
 def map_account_or_department(row: pd.Series) -> Optional[str]:
@@ -693,7 +750,6 @@ def map_account_or_department(row: pd.Series) -> Optional[str]:
     for acc, line in ACCOUNT_TO_LINE.items():
         if acc in digits:
             return line
-
     for keyword, line in DEPARTMENT_KEYWORDS.items():
         if normalize_key(keyword) in norm_text:
             return line
@@ -708,147 +764,156 @@ def map_account_or_department(row: pd.Series) -> Optional[str]:
         return "Intangible_Total"
     if "amort" in norm_text and "tangible" in norm_text:
         return "Tangible_Total"
-
     return None
 
 
 def normalize_pnl_source(
-    raw_df: pd.DataFrame,
+    df: pd.DataFrame,
+    mapping: Dict[str, Any],
     source_type: str,
     source_file: str,
     default_currency: str,
     sign_mode: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return normalized pnl_long and optional dealer_master."""
-    df = standardize_columns(raw_df)
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return pnl_long, dealer_master, audit dataframe."""
     if df.empty:
-        return make_empty_long(), pd.DataFrame()
+        return make_empty_long(), pd.DataFrame(), pd.DataFrame()
 
-    if source_type == "Dealer Master / Akpet Dealer List":
-        return make_empty_long(), normalize_dealer_master(df)
+    mapping_mode = mapping.get("mode", "Kolon mapping / wide source")
+    default_year = mapping.get("default_year")
+    default_month = mapping.get("default_month")
 
-    df = parse_period_columns(df)
+    if source_type == "Dealer Master / Akpet Dealer List" or mapping_mode == "Dealer master mapping":
+        return make_empty_long(), normalize_dealer_master(df, mapping), pd.DataFrame()
 
-    # Common currency/product fields
-    currency_col = first_existing_column(df, ["Currency", "Currency_Type", "Para Birimi", "PB"])
-    attr2_col = first_existing_column(df, ["Attribute.2", "Attribute_2", "Product_Currency", "Product Currency", "Ürün Para Birimi"])
-    product_col = first_existing_column(df, ["Product", "Ürün", "Urun"])
+    # Build base info frame
+    info_map = mapping.get("info_map", {})
+    base = pd.DataFrame(index=df.index)
+    for canonical in INFO_COLS:
+        source_col = info_map.get(canonical)
+        if source_col and source_col in df.columns:
+            base[canonical] = df[source_col]
+        else:
+            base[canonical] = np.nan
 
-    if currency_col:
-        df["Currency"] = df[currency_col].astype(str).apply(lambda x: detect_currency_from_text(x, default_currency))
-    elif attr2_col:
-        df["Currency"] = df[attr2_col].astype(str).apply(lambda x: detect_currency_from_text(x, default_currency))
+    # Long/premapped source mode
+    rows: List[pd.DataFrame] = []
+    unmapped_records: List[Dict[str, Any]] = []
+
+    product_col = mapping.get("product_col")
+    currency_col = mapping.get("currency_col")
+
+    if product_col and product_col in df.columns:
+        product_series = df[product_col].apply(detect_product_from_text)
     else:
-        df["Currency"] = default_currency
+        product_series = pd.Series("Total", index=df.index)
 
-    if product_col:
-        df["Product"] = df[product_col].astype(str).apply(detect_product_from_text)
-    elif attr2_col:
-        df["Product"] = df[attr2_col].astype(str).apply(detect_product_from_text)
+    if currency_col and currency_col in df.columns:
+        currency_series = df[currency_col].apply(lambda x: detect_currency_from_text(x, default_currency))
     else:
-        df["Product"] = "Total"
+        currency_series = pd.Series(default_currency, index=df.index)
 
-    line_col = first_existing_column(df, ["P&L Line", "PNL Line", "Attribute.1", "Attribute_1", "Heading", "Kalem", "Metric"])
-    value_col = first_existing_column(df, ["Value", "Amount", "Tutar", "Deger", "Değer", "Balance", "Bakiye"])
+    if mapping_mode == "Long P&L / pre-mapped source":
+        line_col = mapping.get("long_line_col")
+        value_col = mapping.get("long_value_col")
+        if line_col and value_col and line_col in df.columns and value_col in df.columns:
+            tmp = base.copy()
+            tmp["P&L Line"] = df[line_col].apply(lambda x: resolve_line_name(x) or str(x).strip())
+            tmp["Value"] = df[value_col]
+            tmp["Product"] = product_series
+            tmp["Currency"] = currency_series
+            rows.append(tmp)
 
-    id_cols = [c for c in INFO_COLS + ["Currency", "Product"] if c in df.columns]
-
-    normalized = make_empty_long()
-
-    # Case 1: already long format
-    if line_col and value_col:
-        tmp = df[id_cols + [line_col, value_col]].copy()
-        tmp = tmp.rename(columns={line_col: "Raw Line", value_col: "Value"})
-        tmp["P&L Line"] = tmp["Raw Line"].apply(lambda x: resolve_line_name(x) or str(x).strip())
-        normalized = tmp.drop(columns=["Raw Line"])
-
-    # Case 2: wide format where columns are P&L lines
-    if normalized.empty:
-        wide_line_cols = []
-        for c in df.columns:
-            if c in id_cols:
-                continue
-            if resolve_line_name(c):
-                wide_line_cols.append(c)
-        if wide_line_cols:
-            tmp = df.melt(
-                id_vars=[c for c in id_cols if c in df.columns],
-                value_vars=wide_line_cols,
-                var_name="Raw Line",
-                value_name="Value",
-            )
-            tmp["P&L Line"] = tmp["Raw Line"].apply(lambda x: resolve_line_name(x) or str(x).strip())
-            normalized = tmp.drop(columns=["Raw Line"])
-
-    # Case 3: accounting rows with account / cost center / description + amount
-    if normalized.empty:
-        amount_col = value_col or first_existing_column(
-            df,
-            ["Local Currency Amount", "Amount in local currency", "Debit/Credit", "Debit", "Credit", "LC Amount"],
-        )
-        if amount_col:
-            tmp = df[id_cols + [amount_col]].copy()
+    elif mapping_mode == "FBL3N account/department auto mapping":
+        value_col = mapping.get("long_value_col") or first_existing_column(df, ["Amount", "Tutar", "Local Currency Amount", "Amount in local currency", "Balance", "Bakiye", "Debit/Credit", "Debit", "Credit"])
+        if value_col and value_col in df.columns:
+            tmp = base.copy()
             tmp["P&L Line"] = df.apply(map_account_or_department, axis=1)
-            tmp = tmp.rename(columns={amount_col: "Value"})
+            tmp["Value"] = df[value_col]
+            tmp["Product"] = product_series
+            tmp["Currency"] = currency_series
             tmp = tmp[tmp["P&L Line"].notna()]
-            normalized = tmp
+            rows.append(tmp)
 
-    if normalized.empty:
-        return make_empty_long(), pd.DataFrame()
+    else:
+        # Wide mapping: each selected source column becomes a P&L line.
+        for line, source_col in mapping.get("line_map", {}).items():
+            if source_col and source_col in df.columns:
+                tmp = base.copy()
+                tmp["P&L Line"] = line
+                tmp["Value"] = df[source_col]
+                tmp["Product"] = product_series
+                tmp["Currency"] = currency_series
+                rows.append(tmp)
+
+        # Smart ZSD50 mapping: split one metric into Fuel/Gas line based on Product.
+        for smart_name, source_col in mapping.get("smart_map", {}).items():
+            if source_col and source_col in df.columns:
+                tmp = base.copy()
+                raw_product = df[product_col] if product_col and product_col in df.columns else product_series
+                tmp["P&L Line"] = raw_product.apply(lambda x: classify_smart_product_line(smart_name, x))
+                tmp["Value"] = df[source_col]
+                tmp["Product"] = product_series
+                tmp["Currency"] = currency_series
+                rows.append(tmp)
+
+        mapped_cols = set([c for c in mapping.get("line_map", {}).values() if c] + [c for c in mapping.get("smart_map", {}).values() if c])
+        numeric_candidates = []
+        for c in df.columns:
+            if c in mapped_cols:
+                continue
+            vals = coerce_numeric(df[c])
+            if vals.notna().sum() > 0 and vals.abs().sum() != 0:
+                numeric_candidates.append(c)
+        for c in numeric_candidates[:50]:
+            unmapped_records.append({
+                "Source File": source_file,
+                "Column": c,
+                "Numeric Non-null Rows": int(coerce_numeric(df[c]).notna().sum()),
+                "Sample Sum": float(coerce_numeric(df[c]).fillna(0).sum()),
+                "Note": "Bu numerik kolon henüz P&L satırına maplenmedi.",
+            })
+
+    if not rows:
+        return make_empty_long(), pd.DataFrame(), pd.DataFrame(unmapped_records)
+
+    out = pd.concat(rows, ignore_index=True)
+    out = parse_period_columns(out, default_year=default_year, default_month=default_month)
 
     for col in INFO_COLS:
-        if col not in normalized.columns:
-            normalized[col] = np.nan
+        if col not in out.columns:
+            out[col] = np.nan
+    out["Currency"] = out["Currency"].fillna(default_currency).astype(str)
+    out["Product"] = out["Product"].fillna("Total").astype(str)
+    out["P&L Line"] = out["P&L Line"].astype(str).str.strip()
+    out = out[out["P&L Line"].isin(P_AND_L_LINES)]
+    out["P&L Type"] = out["P&L Line"].apply(line_type)
+    out["Source Type"] = source_type
+    out["Source File"] = source_file
+    out["Is Calculated"] = False
+    out = apply_sign_policy(out, sign_mode)
+    out = out[out["Value"].notna()]
 
-    normalized["Currency"] = normalized.get("Currency", default_currency).fillna(default_currency).astype(str)
-    normalized["Product"] = normalized.get("Product", "Total").fillna("Total").astype(str)
-    normalized["P&L Line"] = normalized["P&L Line"].astype(str).str.strip()
-    normalized = normalized[normalized["P&L Line"].ne("")]
-    normalized["P&L Type"] = normalized["P&L Line"].apply(line_type)
-    normalized["Source Type"] = source_type
-    normalized["Source File"] = source_file
-    normalized["Is Calculated"] = False
-    normalized = apply_sign_policy(normalized, sign_mode)
-
-    normalized = normalized[INFO_COLS + [
-        "Currency",
-        "Product",
-        "P&L Line",
-        "P&L Type",
-        "Value",
-        "Source Type",
-        "Source File",
-        "Is Calculated",
-    ]]
-
-    return normalized, pd.DataFrame()
+    return out[INFO_COLS + ["Currency", "Product", "P&L Line", "P&L Type", "Value", "Source Type", "Source File", "Is Calculated"]], pd.DataFrame(), pd.DataFrame(unmapped_records)
 
 
 def enrich_with_dealer_master(pnl: pd.DataFrame, dealer_master: pd.DataFrame) -> pd.DataFrame:
     if pnl.empty or dealer_master.empty:
         return pnl
 
-    key = "İstasyon" if "İstasyon" in dealer_master.columns and "İstasyon" in pnl.columns else None
-    if key is None and "Name" in dealer_master.columns and "Name" in pnl.columns:
+    key = "İstasyon" if "İstasyon" in pnl.columns and "İstasyon" in dealer_master.columns else None
+    if key is None and "Name" in pnl.columns and "Name" in dealer_master.columns:
         key = "Name"
     if key is None:
         return pnl
 
     enrich_cols = [
         c for c in [
-            "Contract Beginning",
-            "Contract Expiration",
-            "Name",
-            "District",
-            "City",
-            "Territory",
-            "Territory Manager",
-            "Area Sales Manager",
-            "Dealer/Acenta",
+            "Contract Beginning", "Contract Expiration", "Name", "District", "City",
+            "Territory", "Territory Manager", "Area Sales Manager", "Dealer/Acenta", "Supply city for fuel",
         ]
         if c in dealer_master.columns and c != key
     ]
-
     dealer = dealer_master[[key] + enrich_cols].dropna(subset=[key]).drop_duplicates(subset=[key])
     result = pnl.merge(dealer, on=key, how="left", suffixes=("", "__dealer"))
 
@@ -858,263 +923,158 @@ def enrich_with_dealer_master(pnl: pd.DataFrame, dealer_master: pd.DataFrame) ->
             if col not in result.columns:
                 result[col] = result[dealer_col]
             else:
-                main = blank_to_na(result[col].astype(str).str.strip())
-                result[col] = main.fillna(result[dealer_col])
+                result[col] = result[col].where(blank_to_na(result[col].astype(str)).notna(), result[dealer_col])
             result = result.drop(columns=[dealer_col])
-
     return result
 
 
 # ------------------------------------------------------------
-# Calculations
+# Calculated P&L lines
 # ------------------------------------------------------------
 
-def add_calculated_rows(base: pd.DataFrame) -> pd.DataFrame:
-    if base.empty:
-        return base
+def add_calculated_lines(pnl: pd.DataFrame) -> pd.DataFrame:
+    if pnl.empty:
+        return pnl
 
-    base = base.copy()
-    group_cols = [
-        c for c in INFO_COLS + ["Currency", "Product"]
-        if c in base.columns and c not in ["Date"]
+    raw = pnl.copy()
+    # Avoid duplicating old calculated lines on refresh.
+    raw = raw[~((raw["Is Calculated"] == True) | (raw["P&L Line"].isin(CALCULATED_LINES)))]
+
+    group_cols = [c for c in INFO_COLS + ["Currency"] if c in raw.columns]
+    # Product is not in group for calculated total P&L; calculations are station-period-currency level.
+    group_cols = [c for c in group_cols if c != "Product"]
+
+    wide = raw.pivot_table(index=group_cols, columns="P&L Line", values="Value", aggfunc="sum", fill_value=0).reset_index()
+    wide.columns.name = None
+
+    # Input totals if source does not provide total lines.
+    if "Volume Total" not in wide.columns or safe_get_wide(wide, "Volume Total").abs().sum() == 0:
+        wide["Volume Total"] = safe_get_wide(wide, "Fuel Volume") + safe_get_wide(wide, "Gas Volume")
+    if "Gross Sales Total" not in wide.columns or safe_get_wide(wide, "Gross Sales Total").abs().sum() == 0:
+        wide["Gross Sales Total"] = safe_get_wide(wide, "Fuel Gross Sales") + safe_get_wide(wide, "Gas Gross Sales")
+    if "COGS Total" not in wide.columns or safe_get_wide(wide, "COGS Total").abs().sum() == 0:
+        wide["COGS Total"] = safe_get_wide(wide, "Fuel COGS") + safe_get_wide(wide, "Gas COGS")
+
+    wide["Gross Margin"] = (
+        safe_get_wide(wide, "Gross Sales Total")
+        + safe_get_wide(wide, "Discount Included in Invoice Total")
+        + safe_get_wide(wide, "Discount Premium")
+        + safe_get_wide(wide, "Rebate")
+        + safe_get_wide(wide, "Additive")
+        + safe_get_wide(wide, "ATS Commision Fee")
+        + safe_get_wide(wide, "ATS Discount")
+        + safe_get_wide(wide, "ATS Income")
+        + safe_get_wide(wide, "ATS Disc given to Customers")
+        + safe_get_wide(wide, "COGS Total")
+    )
+
+    wide["Process & Logistic Variable Expenses"] = (
+        safe_get_wide(wide, "Fuel Variable Process Expenses All")
+        + safe_get_wide(wide, "Fuel Variable Logistic Expenses")
+        + safe_get_wide(wide, "Autogas Variable Logistic Expenses")
+    )
+    wide["Process & Logistic Variable Expenses-Level OP1"] = (
+        safe_get_wide(wide, "Gross Margin")
+        + safe_get_wide(wide, "Process & Logistic Variable Expenses")
+        + safe_get_wide(wide, "Transport Income fuel only")
+    )
+    wide["Terminal costs -Level OP2"] = (
+        safe_get_wide(wide, "Process & Logistic Variable Expenses-Level OP1")
+        + safe_get_wide(wide, "TESİS/TERMINALS")
+    )
+    wide["Direct Expenses From Related Departments-Level OP3"] = (
+        safe_get_wide(wide, "BAYİLİK SATIŞLARI/DEALERSHIP SALES")
+        + safe_get_wide(wide, "ATS SATIŞLARI/VIS SALES")
+        + safe_get_wide(wide, "KURUMSAL İLETİŞİM/CORPORATE COMMUNI")
+        + safe_get_wide(wide, "PAZARLAMA/MARKETING")
+        + safe_get_wide(wide, "SATIŞ DESTEK/SALES SUPPORT")
+        + safe_get_wide(wide, "OTOMASYON/AUTOMATION")
+        + safe_get_wide(wide, "MÜHENDİSLİK/ENGINEERING")
+    )
+    wide["Card Expenses/Incomes"] = (
+        safe_get_wide(wide, "Loyalty Card Expenses")
+        + safe_get_wide(wide, "Card Cost All")
+        + safe_get_wide(wide, "Cards Income")
+    )
+    wide["Rent Expenses/Incomes"] = safe_get_wide(wide, "Rent") + safe_get_wide(wide, "Rent Income")
+    wide["Engineering Expenses"] = safe_get_wide(wide, "Engineering Expenses All")
+    wide["Indirect Expenses From Unrelated Departments"] = (
+        safe_get_wide(wide, "MUHASEBE/ACCOUNTING")
+        + safe_get_wide(wide, "İDARİ İŞLER/ADMINISTRATIVE")
+        + safe_get_wide(wide, "İNSAN KAYNAKLARI/HR")
+        + safe_get_wide(wide, "BİLGİ İŞLEM/IT")
+        + safe_get_wide(wide, "GENEL YÖNETİM/GENERAL ADMIN")
+        + safe_get_wide(wide, "OFİS/OFFICE")
+        + safe_get_wide(wide, "İKMAL/SUPPLY")
+        + safe_get_wide(wide, "SEÇ-G/HSSE")
+        + safe_get_wide(wide, "HUKUK/LEGAL")
+    )
+    wide["Incomes Total"] = (
+        safe_get_wide(wide, "Gain on sale of fixed assets All")
+        + safe_get_wide(wide, "Insurance Income All")
+        + safe_get_wide(wide, "Late Payment Charges All")
+        + safe_get_wide(wide, "Price Difference All")
+        + safe_get_wide(wide, "Market Commission Income")
+        + safe_get_wide(wide, "Penalty Charge")
+        + safe_get_wide(wide, "EMRA Fee All")
+        + safe_get_wide(wide, "Transport Income fuel only")
+    )
+    wide["EBITDA"] = (
+        safe_get_wide(wide, "Terminal costs -Level OP2")
+        + safe_get_wide(wide, "Direct Expenses From Related Departments-Level OP3")
+        + safe_get_wide(wide, "Card Expenses/Incomes")
+        + safe_get_wide(wide, "Rent Expenses/Incomes")
+        + safe_get_wide(wide, "Engineering Expenses")
+        + safe_get_wide(wide, "Indirect Expenses From Unrelated Departments")
+        + safe_get_wide(wide, "Incomes Total")
+    )
+    wide["Amortizations"] = safe_get_wide(wide, "Tangible_Total") + safe_get_wide(wide, "Intangible_Total")
+    wide["Net Income"] = safe_get_wide(wide, "EBITDA") + safe_get_wide(wide, "Amortizations")
+    wide["Net Income-Working Capital Cost"] = safe_get_wide(wide, "Net Income") + safe_get_wide(wide, "Working Capital Cost")
+
+    derived_lines = [
+        "Volume Total", "Gross Sales Total", "COGS Total",
+        "Gross Margin", "Process & Logistic Variable Expenses", "Process & Logistic Variable Expenses-Level OP1",
+        "Terminal costs -Level OP2", "Direct Expenses From Related Departments-Level OP3",
+        "Card Expenses/Incomes", "Rent Expenses/Incomes", "Engineering Expenses",
+        "Indirect Expenses From Unrelated Departments", "Incomes Total", "EBITDA",
+        "Amortizations", "Net Income", "Net Income-Working Capital Cost",
     ]
 
-    # Calculations should be per period/station/currency/product.
-    pivot = base.groupby(group_cols + ["P&L Line"], dropna=False)["Value"].sum().unstack("P&L Line", fill_value=0.0)
-
-    def val(line: str) -> pd.Series:
-        if line in pivot.columns:
-            return pivot[line].astype(float)
-        return pd.Series(0.0, index=pivot.index)
-
-    calc: Dict[str, pd.Series] = {}
-
-    calc["Gross Margin"] = (
-        val("Gross Sales Total")
-        + val("Discount Included in Invoice Total")
-        + val("Discount Premium")
-        + val("Rebate")
-        + val("Additive")
-        + val("ATS Commision Fee")
-        + val("ATS Discount")
-        + val("ATS Income")
-        + val("ATS Disc given to Customers")
-        + val("COGS Total")
-    )
-
-    calc["Card Expenses/Incomes"] = (
-        val("Loyalty Card Expenses") + val("Card Cost All") + val("Cards Income")
-    )
-    calc["Rent Expenses/Incomes"] = val("Rent") + val("Rent Income")
-    calc["Engineering Expenses"] = val("Engineering Expenses All")
-    calc["Indirect Expenses From Unrelated Departments"] = (
-        val("MUHASEBE/ACCOUNTING")
-        + val("İDARİ İŞLER/ADMINISTRATIVE")
-        + val("İNSAN KAYNAKLARI/HR")
-        + val("BİLGİ İŞLEM/IT")
-        + val("GENEL YÖNETİM/GENERAL ADMIN")
-        + val("OFİS/OFFICE")
-        + val("İKMAL/SUPPLY")
-        + val("TESİS/TERMINALS")
-        + val("SEÇ-G/HSSE")
-        + val("HUKUK/LEGAL")
-    )
-    calc["Incomes Total"] = (
-        val("Gain on sale of fixed assets All")
-        + val("Insurance Income All")
-        + val("Late Payment Charges All")
-        + val("Price Difference All")
-        + val("Market Commission Income")
-        + val("Penalty Charge")
-        + val("EMRA Fee All")
-        + val("Transport Income fuel only")
-    )
-    calc["Amortizations"] = val("Tangible_Total") + val("Intangible_Total")
-    calc["Process & Logistic Variable Expenses"] = (
-        val("Fuel Variable Process Expenses All")
-        + val("Fuel Variable Logistic Expenses")
-        + val("Transport Income fuel only")
-        + val("Autogas Variable Logistic Expenses")
-    )
-    calc["Process & Logistic Variable Expenses-Level OP1"] = (
-        calc["Gross Margin"] + calc["Process & Logistic Variable Expenses"]
-    )
-    calc["Terminal costs -Level OP2"] = (
-        calc["Process & Logistic Variable Expenses-Level OP1"] + val("TESİS/TERMINALS")
-    )
-    calc["Direct Expenses From Related Departments-Level OP3"] = (
-        val("BAYİLİK SATIŞLARI/DEALERSHIP SALES")
-        + val("ATS SATIŞLARI/VIS SALES")
-        + val("KURUMSAL İLETİŞİM/CORPORATE COMMUNI")
-        + val("PAZARLAMA/MARKETING")
-        + val("SATIŞ DESTEK/SALES SUPPORT")
-        + val("OTOMASYON/AUTOMATION")
-        + val("MÜHENDİSLİK/ENGINEERING")
-    )
-    calc["EBITDA"] = (
-        calc["Terminal costs -Level OP2"]
-        + calc["Direct Expenses From Related Departments-Level OP3"]
-        + calc["Card Expenses/Incomes"]
-        + calc["Rent Expenses/Incomes"]
-        + calc["Engineering Expenses"]
-        + calc["Indirect Expenses From Unrelated Departments"]
-        + calc["Incomes Total"]
-    )
-    calc["Net Income"] = calc["EBITDA"] + calc["Amortizations"]
-    calc["Net Income-Working Capital Cost"] = calc["Net Income"] + val("Working Capital Cost")
-
-    calc_df = pd.DataFrame(calc).reset_index()
-    calc_long = calc_df.melt(
-        id_vars=group_cols,
-        value_vars=list(calc.keys()),
-        var_name="P&L Line",
-        value_name="Value",
-    )
-    calc_long["P&L Type"] = "Calculated Area"
-    calc_long["Source Type"] = "Calculated"
-    calc_long["Source File"] = "System Formula"
-    calc_long["Is Calculated"] = True
-    calc_long["Date"] = pd.to_datetime(calc_long.get("Date", pd.NaT), errors="coerce") if "Date" in calc_long.columns else pd.NaT
-
+    calc = wide[group_cols + derived_lines].melt(id_vars=group_cols, value_vars=derived_lines, var_name="P&L Line", value_name="Value")
+    calc["Product"] = "Total"
+    calc["P&L Type"] = calc["P&L Line"].apply(line_type)
+    calc["Source Type"] = "Calculated"
+    calc["Source File"] = "Calculated"
+    calc["Is Calculated"] = True
     for col in INFO_COLS:
-        if col not in calc_long.columns:
-            calc_long[col] = np.nan
+        if col not in calc.columns:
+            calc[col] = np.nan
 
-    calc_long = calc_long[INFO_COLS + [
-        "Currency",
-        "Product",
-        "P&L Line",
-        "P&L Type",
-        "Value",
-        "Source Type",
-        "Source File",
-        "Is Calculated",
-    ]]
-
-    result = pd.concat([base, calc_long], ignore_index=True)
-    result = parse_period_columns(result)
-    return result
-
-
-def build_master_report(
-    uploaded_files: List,
-    file_options: Dict[str, Dict[str, str]],
-    replace_calculated: bool,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    pnl_parts: List[pd.DataFrame] = []
-    dealer_parts: List[pd.DataFrame] = []
-    audit_rows: List[Dict[str, object]] = []
-
-    for idx, file in enumerate(uploaded_files):
-        opts = file_options[file.name]
-        df = read_uploaded_dataframe(file, opts.get("sheet_name"))
-        pnl, dealer = normalize_pnl_source(
-            raw_df=df,
-            source_type=opts["source_type"],
-            source_file=file.name,
-            default_currency=opts["currency"],
-            sign_mode=opts["sign_mode"],
-        )
-
-        if not pnl.empty:
-            pnl_parts.append(pnl)
-        if not dealer.empty:
-            dealer_parts.append(dealer)
-
-        audit_rows.append(
-            {
-                "File": file.name,
-                "Source Type": opts["source_type"],
-                "Rows In File": len(df),
-                "Normalized P&L Rows": len(pnl),
-                "Dealer Rows": len(dealer),
-                "Sheet": opts.get("sheet_name") or "CSV",
-                "Default Currency": opts["currency"],
-                "Sign Mode": opts["sign_mode"],
-            }
-        )
-
-    pnl_all = pd.concat(pnl_parts, ignore_index=True) if pnl_parts else make_empty_long()
-    dealer_all = pd.concat(dealer_parts, ignore_index=True) if dealer_parts else pd.DataFrame()
-    if not dealer_all.empty:
-        pnl_all = enrich_with_dealer_master(pnl_all, dealer_all)
-
-    pnl_all = parse_period_columns(pnl_all)
-    if replace_calculated:
-        pnl_base = pnl_all[~pnl_all["P&L Line"].isin(CALCULATED_LINES)].copy()
-    else:
-        pnl_base = pnl_all.copy()
-
-    master = add_calculated_rows(pnl_base)
-    audit = pd.DataFrame(audit_rows)
-    unmapped = (
-        master[master["P&L Type"].eq("Unmapped")]
-        .groupby(["P&L Line", "Source Type", "Source File"], dropna=False)["Value"]
-        .agg(["count", "sum"])
-        .reset_index()
-    ) if not master.empty else pd.DataFrame()
-
-    return master, audit, unmapped
-
-
-def save_master_report(master: pd.DataFrame, audit: pd.DataFrame) -> None:
-    master.to_pickle(MASTER_FILE)
-    manifest = {
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "rows": int(len(master)),
-        "stations": int(master["İstasyon"].nunique(dropna=True)) if "İstasyon" in master.columns else 0,
-        "audit": audit.to_dict(orient="records") if not audit.empty else [],
-    }
-    MANIFEST_FILE.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_master_report() -> pd.DataFrame:
-    if MASTER_FILE.exists():
-        return pd.read_pickle(MASTER_FILE)
-    return pd.DataFrame()
-
-
-def load_manifest() -> Dict[str, object]:
-    if MANIFEST_FILE.exists():
-        try:
-            return json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def line_dictionary() -> pd.DataFrame:
-    rows = []
-    order_map = {line: i + 1 for i, line in enumerate(PNL_ORDER)}
-    for line, meta in LINE_INFO.items():
-        rows.append(
-            {
-                "Order": order_map.get(line, 9999),
-                "P&L Line": line,
-                "Type": meta.get("type", ""),
-                "Default Source": meta.get("source", ""),
-                "Is Calculated": line in CALCULATED_LINES,
-            }
-        )
-    return pd.DataFrame(rows).sort_values(["Order", "P&L Line"])
+    # Replace calculated/total lines with the formula result to prevent double counting.
+    # Example: if ZSD50 already has Gross Sales Total, the formula keeps that value
+    # but the raw line is removed before appending the calculated line.
+    raw_without_replaced_lines = raw[~raw["P&L Line"].isin(derived_lines)].copy()
+    combined = pd.concat([raw_without_replaced_lines, calc[raw.columns]], ignore_index=True)
+    return combined
 
 
 # ------------------------------------------------------------
-# Reporting functions
+# Aggregation and display helpers
 # ------------------------------------------------------------
 
 def aggregate_long(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame()
-    group_cols = [c for c in group_cols if c in df.columns]
-    return df.groupby(group_cols + ["P&L Line"], dropna=False, as_index=False)["Value"].sum()
+        return pd.DataFrame(columns=group_cols + ["P&L Line", "Value"])
+    cols = [c for c in group_cols if c in df.columns] + ["P&L Line"]
+    return df.groupby(cols, dropna=False, as_index=False)["Value"].sum()
 
 
 def make_wide(df: pd.DataFrame, index_cols: List[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    index_cols = [c for c in index_cols if c in df.columns]
-    wide = df.pivot_table(index=index_cols, columns="P&L Line", values="Value", aggfunc="sum", fill_value=0).reset_index()
+    idx = [c for c in index_cols if c in df.columns]
+    wide = df.pivot_table(index=idx, columns="P&L Line", values="Value", aggfunc="sum", fill_value=0).reset_index()
     wide.columns.name = None
     for line in SUMMARY_LINES:
         if line not in wide.columns:
@@ -1123,386 +1083,424 @@ def make_wide(df: pd.DataFrame, index_cols: List[str]) -> pd.DataFrame:
     wide["EBITDA %"] = np.where(wide["Gross Sales Total"] != 0, wide["EBITDA"] / wide["Gross Sales Total"], np.nan)
     wide["Net Income %"] = np.where(wide["Gross Sales Total"] != 0, wide["Net Income"] / wide["Gross Sales Total"], np.nan)
     wide["Net Income / Volume"] = np.where(wide["Volume Total"] != 0, wide["Net Income"] / wide["Volume Total"], np.nan)
-    wide["Gross Margin / Volume"] = np.where(wide["Volume Total"] != 0, wide["Gross Margin"] / wide["Volume Total"], np.nan)
     return wide
 
 
 def pnl_statement(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["Order", "P&L Line", "P&L Type", "Value"])
+    stmt = df.groupby(["P&L Line", "P&L Type"], as_index=False)["Value"].sum()
     order_map = {line: i + 1 for i, line in enumerate(PNL_ORDER)}
-    stmt = df.groupby(["P&L Line", "P&L Type"], dropna=False, as_index=False)["Value"].sum()
     stmt["Order"] = stmt["P&L Line"].map(order_map).fillna(9999).astype(int)
     return stmt.sort_values(["Order", "P&L Line"])[["Order", "P&L Line", "P&L Type", "Value"]]
-
-
-def get_line_value(stmt: pd.DataFrame, line: str) -> float:
-    if stmt.empty:
-        return 0.0
-    return float(stmt.loc[stmt["P&L Line"].eq(line), "Value"].sum())
-
-
-def style_numeric_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    money_cols = [c for c in df.columns if c in SUMMARY_LINES or c in ["Gross Margin", "EBITDA", "Net Income"]]
-    pct_cols = [c for c in df.columns if "%" in c]
-    per_volume_cols = [c for c in df.columns if "/ Volume" in c]
-    fmt = {"Volume Total": "{:,.0f}"}
-    fmt.update({c: "{:,.0f}" for c in money_cols})
-    fmt.update({c: "{:.2%}" for c in pct_cols})
-    fmt.update({c: "{:,.4f}" for c in per_volume_cols})
-    return df.style.format(fmt)
 
 
 def download_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
+def style_numeric_table(df: pd.DataFrame):
+    fmt = {}
+    for col in df.columns:
+        if col.endswith("%"):
+            fmt[col] = "{:.2%}"
+        elif col in SUMMARY_LINES or col in P_AND_L_LINES or "Income" in col or "Sales" in col or "COGS" in col or "Margin" in col or "EBITDA" in col or "Volume" in col:
+            fmt[col] = "{:,.2f}"
+    return df.style.format(fmt)
+
+
 # ------------------------------------------------------------
-# Admin UI
+# Admin mapping UI
 # ------------------------------------------------------------
 
-def admin_login_ui() -> bool:
-    st.sidebar.divider()
-    st.sidebar.subheader("Admin")
-    if st.session_state.get("is_admin"):
-        st.sidebar.success("Admin girişi aktif")
-        if st.sidebar.button("Admin çıkış"):
-            st.session_state["is_admin"] = False
-            st.rerun()
-        return True
+def mapping_ui_for_file(file, idx: int, saved_config: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], Dict[str, Any]]:
+    file_bytes = file.getvalue()
+    file_name = file.name
+    file_key = f"file_{idx}_{normalize_key(file_name)}"
 
-    password = st.sidebar.text_input("Admin şifresi", type="password")
-    if st.sidebar.button("Admin girişi"):
-        if password == ADMIN_PASSWORD:
-            st.session_state["is_admin"] = True
-            st.rerun()
-        else:
-            st.sidebar.error("Şifre hatalı")
-    return False
+    with st.expander(f"{idx + 1}. {file_name}", expanded=True):
+        sheet_name = None
+        if file_name.lower().endswith((".xlsx", ".xlsm", ".xls")):
+            sheets = get_excel_sheets(file_bytes)
+            default_sheet = 0
+            saved_sheet = saved_config.get(file_name, {}).get("sheet_name")
+            if saved_sheet in sheets:
+                default_sheet = sheets.index(saved_sheet)
+            sheet_name = st.selectbox("Excel sayfası", sheets, index=default_sheet, key=f"{file_key}_sheet")
 
-
-def render_admin_panel() -> None:
-    st.header("🔐 Admin Paneli")
-    st.caption("Bu bölüm sadece admin içindir. Kullanıcılar upload alanını görmez; sadece son güncellenmiş dashboardı görür.")
-
-    current_manifest = load_manifest()
-    if current_manifest:
-        st.success(
-            f"Mevcut master rapor: {current_manifest.get('updated_at', '-')} | "
-            f"Satır: {current_manifest.get('rows', 0):,} | "
-            f"İstasyon: {current_manifest.get('stations', 0):,}"
+        raw = read_uploaded_raw(file, sheet_name)
+        guessed = guess_header_row(raw)
+        saved_header = saved_config.get(file_name, {}).get("header_row")
+        header_row = st.number_input(
+            "Başlık satırı indexi — ekrandaki ZSD50 örneğinde gerçek başlık satırı 1 olabilir",
+            min_value=0,
+            max_value=max(0, min(50, len(raw) - 1)),
+            value=int(saved_header if saved_header is not None else guessed),
+            step=1,
+            key=f"{file_key}_header",
         )
 
-    with st.expander("P&L hesaplama sözlüğü / kaynak yapısı", expanded=False):
-        st.dataframe(line_dictionary(), use_container_width=True, height=420)
+        preview_cols = st.columns(2)
+        with preview_cols[0]:
+            st.caption("Ham dosya ilk 8 satır")
+            st.dataframe(raw.head(8), use_container_width=True, height=230)
+        df = make_dataframe_from_header(raw, int(header_row))
+        with preview_cols[1]:
+            st.caption("Seçilen başlık satırı sonrası okunan veri")
+            st.dataframe(df.head(8), use_container_width=True, height=230)
 
-    replace_calculated = st.checkbox(
-        "Hesaplanan P&L satırlarını sistem yeniden hesaplasın",
-        value=True,
-        help="Önerilen kullanım: Açık. Böylece Gross Margin, EBITDA, Net Income gibi satırlar kaynak dosyalardan değil formüllerden üretilir.",
-    )
+        source_type = st.selectbox("Kaynak tipi", SOURCE_TYPES, key=f"{file_key}_source")
+        default_currency = st.selectbox("Varsayılan para birimi", CURRENCY_OPTIONS, index=0, key=f"{file_key}_currency")
+        sign_mode = st.selectbox("İşaret politikası", SIGN_MODES, index=0, key=f"{file_key}_sign")
 
-    uploaded_files = st.file_uploader(
-        "Kaynak dosyaları yükle: Sales, Dealer List, FBL3N, Discount Premium, Rebate, ATS, Amortization, manuel dosyalar",
-        type=["xlsx", "xlsm", "xls", "csv"],
-        accept_multiple_files=True,
-    )
+        saved_by_source = saved_config.get("by_source_type", {}).get(source_type, {})
+        guessed_mapping = guess_mapping_for_source(source_type, list(df.columns))
+        base_mapping = {**guessed_mapping, **saved_by_source}
+        base_mapping.setdefault("info_map", guessed_mapping.get("info_map", {}))
+        base_mapping.setdefault("line_map", guessed_mapping.get("line_map", {}))
+        base_mapping.setdefault("smart_map", guessed_mapping.get("smart_map", {}))
 
-    file_options: Dict[str, Dict[str, str]] = {}
+        if source_type == "Dealer Master / Akpet Dealer List":
+            mapping_mode_options = ["Dealer master mapping"]
+        elif source_type == "FBL3N Accounting Records":
+            mapping_mode_options = ["FBL3N account/department auto mapping", "Kolon mapping / wide source", "Long P&L / pre-mapped source"]
+        else:
+            mapping_mode_options = ["Kolon mapping / wide source", "Long P&L / pre-mapped source", "FBL3N account/department auto mapping"]
 
-    if uploaded_files:
-        st.subheader("Dosya eşleştirme")
-        for i, file in enumerate(uploaded_files):
-            with st.expander(f"{i + 1}. {file.name}", expanded=i == 0):
-                file_bytes = file.getvalue()
-                sheet_name: Optional[str] = None
-                if file.name.lower().endswith((".xlsx", ".xlsm", ".xls")):
-                    try:
-                        sheets = get_excel_sheets(file_bytes)
-                        sheet_name = st.selectbox("Excel sayfası", sheets, key=f"sheet_{file.name}_{i}")
-                    except Exception as exc:
-                        st.error(f"Excel sayfaları okunamadı: {exc}")
+        saved_mode = base_mapping.get("mode", mapping_mode_options[0])
+        mode_index = mapping_mode_options.index(saved_mode) if saved_mode in mapping_mode_options else 0
+        mapping_mode = st.selectbox("Mapping modu", mapping_mode_options, index=mode_index, key=f"{file_key}_mode")
 
-                source_type = st.selectbox("Kaynak tipi", SOURCE_TYPES, key=f"source_{file.name}_{i}")
-                currency = st.selectbox("Varsayılan para birimi", CURRENCY_OPTIONS, key=f"currency_{file.name}_{i}")
-                sign_mode = st.selectbox(
-                    "İşaret politikası",
-                    SIGN_MODES,
-                    key=f"sign_{file.name}_{i}",
-                    help="SAP/FBL3N tutarları zaten eksi-artı geliyorsa 'Dosyadaki işaretleri koru'. Tüm tutarlar pozitif geliyorsa tip bazlı otomatik işaret ver.",
-                )
+        columns = list(df.columns)
+        mapping: Dict[str, Any] = {
+            "mode": mapping_mode,
+            "info_map": {},
+            "line_map": {},
+            "smart_map": {},
+            "product_col": None,
+            "currency_col": None,
+            "long_line_col": None,
+            "long_value_col": None,
+            "default_year": datetime.now().year,
+            "default_month": datetime.now().month,
+        }
 
-                try:
-                    preview = read_uploaded_dataframe(file, sheet_name)
-                    st.write(f"Satır: {len(preview):,} | Kolon: {len(preview.columns):,}")
-                    st.dataframe(preview.head(20), use_container_width=True, height=220)
-                except Exception as exc:
-                    st.error(f"Önizleme okunamadı: {exc}")
+        st.markdown("##### Ortak bilgi kolonları")
+        c_year, c_month = st.columns(2)
+        with c_year:
+            mapping["default_year"] = st.number_input("Dosyada yıl yoksa varsayılan yıl", min_value=2020, max_value=2100, value=int(base_mapping.get("default_year") or datetime.now().year), key=f"{file_key}_default_year")
+        with c_month:
+            mapping["default_month"] = st.number_input("Dosyada ay yoksa varsayılan ay", min_value=1, max_value=12, value=int(base_mapping.get("default_month") or datetime.now().month), key=f"{file_key}_default_month")
 
-                file_options[file.name] = {
-                    "sheet_name": sheet_name or "",
-                    "source_type": source_type,
-                    "currency": currency,
-                    "sign_mode": sign_mode,
-                }
+        info_cols_left, info_cols_right = st.columns(2)
+        for n, info in enumerate(INFO_COLS):
+            container = info_cols_left if n % 2 == 0 else info_cols_right
+            with container:
+                saved = base_mapping.get("info_map", {}).get(info)
+                default_idx = select_default(columns, saved=saved, candidates=INFO_ALIASES.get(info, []) + [info])
+                mapping["info_map"][info] = clean_selected(st.selectbox(info, options_with_none(columns), index=default_idx, key=f"{file_key}_info_{info}"))
 
-        if st.button("✅ Master P&L raporunu oluştur / güncelle", type="primary"):
-            with st.spinner("Kaynak dosyalar normalize ediliyor, hesaplamalar yapılıyor ve master rapor kaydediliyor..."):
-                try:
-                    master, audit, unmapped = build_master_report(uploaded_files, file_options, replace_calculated)
-                    if master.empty:
-                        st.error("Master rapor oluşmadı. Dosyalarda P&L line + Value veya tanınan wide kolonlar bulunamadı.")
-                    else:
-                        save_master_report(master, audit)
-                        st.success("Master P&L raporu güncellendi. Artık tüm kullanıcılar yeni dashboardı görebilir.")
-                        st.subheader("Yükleme özeti")
-                        st.dataframe(audit, use_container_width=True)
-                        if not unmapped.empty:
-                            st.warning("Bazı satırlar P&L kalemine maplenemedi. Aşağıdaki tabloyu kontrol et.")
-                            st.dataframe(unmapped, use_container_width=True, height=300)
-                        st.download_button(
-                            "Master normalize raporu CSV indir",
-                            data=download_csv(master),
-                            file_name="master_pnl_report.csv",
-                            mime="text/csv",
-                        )
-                except Exception as exc:
-                    st.exception(exc)
+        st.markdown("##### Ürün / para birimi")
+        c1, c2 = st.columns(2)
+        with c1:
+            mapping["product_col"] = clean_selected(st.selectbox(
+                "Ürün kolonu — Fuel/Gas ayırmak için",
+                options_with_none(columns),
+                index=select_default(columns, saved=base_mapping.get("product_col"), candidates=["Product", "Ürün Açıklaması", "Ürün", "Malzeme", "Tanım"]),
+                key=f"{file_key}_product_col",
+            ))
+        with c2:
+            mapping["currency_col"] = clean_selected(st.selectbox(
+                "Para birimi kolonu",
+                options_with_none(columns),
+                index=select_default(columns, saved=base_mapping.get("currency_col"), candidates=["Currency", "Currency_Type", "Para Birimi"]),
+                key=f"{file_key}_currency_col",
+            ))
 
-    st.divider()
-    danger_col, _ = st.columns([1, 3])
-    with danger_col:
-        if st.button("Mevcut master raporu sil", type="secondary"):
-            if MASTER_FILE.exists():
-                MASTER_FILE.unlink()
-            if MANIFEST_FILE.exists():
-                MANIFEST_FILE.unlink()
-            st.warning("Master rapor silindi.")
-            st.rerun()
+        if mapping_mode == "Long P&L / pre-mapped source":
+            l1, l2 = st.columns(2)
+            with l1:
+                mapping["long_line_col"] = clean_selected(st.selectbox(
+                    "P&L Line / Heading kolonu",
+                    options_with_none(columns),
+                    index=select_default(columns, saved=base_mapping.get("long_line_col"), candidates=["P&L Line", "Attribute.1", "Heading", "Kalem"]),
+                    key=f"{file_key}_long_line",
+                ))
+            with l2:
+                mapping["long_value_col"] = clean_selected(st.selectbox(
+                    "Value / Amount kolonu",
+                    options_with_none(columns),
+                    index=select_default(columns, saved=base_mapping.get("long_value_col"), candidates=["Value", "Amount", "Tutar", "Değer", "Balance"]),
+                    key=f"{file_key}_long_value",
+                ))
+
+        elif mapping_mode == "FBL3N account/department auto mapping":
+            mapping["long_value_col"] = clean_selected(st.selectbox(
+                "FBL3N tutar kolonu",
+                options_with_none(columns),
+                index=select_default(columns, saved=base_mapping.get("long_value_col"), candidates=["Amount", "Tutar", "Local Currency Amount", "Amount in local currency", "Balance", "Bakiye"]),
+                key=f"{file_key}_fbl3n_amount",
+            ))
+            st.info("Bu modda hesap numarası / cost center / açıklama alanları satır bazında taranır ve P&L satırı otomatik bulunur.")
+
+        elif mapping_mode == "Kolon mapping / wide source":
+            st.markdown("##### ZSD50 gibi wide kaynaklar için akıllı mapping")
+            s1, s2, s3 = st.columns(3)
+            smart_options = {
+                "Volume by product": ["Ftrl.mkt.", "Miktar", "Invoice Quantity", "Billing Quantity", "Net ağırlık", "Net agirlik"],
+                "Gross Sales by product": ["Satış Fiyatı", "Satis Fiyati", "Gross Sales", "TL-Net Değer", "TL Net Deger", "Net Değer"],
+                "COGS by product": ["Maliyet", "COGS", "Cost", "Akpet Fuel Cost", "Akpet Gas Cost"],
+            }
+            for j, (smart_name, candidates) in enumerate(smart_options.items()):
+                container = [s1, s2, s3][j]
+                with container:
+                    saved = base_mapping.get("smart_map", {}).get(smart_name)
+                    mapping["smart_map"][smart_name] = clean_selected(st.selectbox(
+                        smart_name,
+                        options_with_none(columns),
+                        index=select_default(columns, saved=saved, candidates=candidates),
+                        key=f"{file_key}_smart_{smart_name}",
+                    ))
+
+            st.markdown("##### Direkt P&L satır mapping")
+            important_lines = [
+                "Volume Total", "Gross Sales Total", "Discount Included in Invoice Total", "Discount Premium", "Rebate", "Additive",
+                "ATS Commision Fee", "ATS Discount", "ATS Income", "ATS Disc given to Customers", "COGS Total",
+                "Fuel Variable Process Expenses All", "Fuel Variable Logistic Expenses", "Transport Income fuel only",
+                "Autogas Variable Logistic Expenses", "Loyalty Card Expenses", "Card Cost All", "Cards Income", "Rent", "Rent Income",
+                "Tangible_Total", "Intangible_Total", "Working Capital Cost",
+            ]
+            col_a, col_b = st.columns(2)
+            for n, line in enumerate(important_lines):
+                container = col_a if n % 2 == 0 else col_b
+                with container:
+                    saved = base_mapping.get("line_map", {}).get(line)
+                    mapping["line_map"][line] = clean_selected(st.selectbox(
+                        line,
+                        options_with_none(columns),
+                        index=select_default(columns, saved=saved, candidates=[line]),
+                        key=f"{file_key}_line_{line}",
+                    ))
+
+        file_meta = {
+            "file_name": file_name,
+            "sheet_name": sheet_name,
+            "header_row": int(header_row),
+            "source_type": source_type,
+            "default_currency": default_currency,
+            "sign_mode": sign_mode,
+        }
+        return df, mapping, file_meta
 
 
 # ------------------------------------------------------------
 # Dashboard UI
 # ------------------------------------------------------------
 
-def render_dashboard(master: pd.DataFrame) -> None:
-    manifest = load_manifest()
-    st.title("⛽ Franchise Station P&L Dashboard")
-    if manifest:
-        st.caption(
-            f"Son güncelleme: {manifest.get('updated_at', '-')} | "
-            f"Master satır: {manifest.get('rows', 0):,} | "
-            f"İstasyon: {manifest.get('stations', 0):,}"
-        )
-    else:
-        st.caption("Son güncelleme bilgisi bulunamadı.")
-
-    if master.empty:
-        st.info("Henüz yayınlanmış master P&L raporu yok. Admin panelinden kaynak dosyalar yüklenip master rapor oluşturulmalı.")
-        return
-
-    master = parse_period_columns(master)
-
+def dashboard_ui(master: pd.DataFrame) -> None:
     st.sidebar.header("Filtreler")
     currency_values = safe_unique(master, "Currency") or CURRENCY_OPTIONS
-    currency = st.sidebar.radio("Para Birimi", currency_values, horizontal=True)
-
-    product_values = safe_unique(master, "Product") or ["Total"]
-    default_products = ["Total"] if "Total" in product_values else product_values[:1]
-    products = st.sidebar.multiselect("Ürün", product_values, default=default_products)
-
+    currency = st.sidebar.radio("Para birimi", currency_values, horizontal=True)
     period_level = st.sidebar.selectbox("Dönem", PERIOD_LEVELS, index=2)
-    master, period_col = selected_period_column(master, period_level)
-    period_values = safe_unique(master, period_col)
-    selected_periods = st.sidebar.multiselect("Dönem seçimi", period_values, default=period_values)
 
-    filtered = master.copy()
-    filtered = filtered[filtered["Currency"].astype(str).eq(currency)]
-    if products:
-        filtered = filtered[filtered["Product"].astype(str).isin(products)]
+    df = master[master["Currency"].astype(str).eq(currency)].copy()
+    df, period_col = selected_period_column(df, period_level)
+
+    period_values = safe_unique(df, period_col)
+    selected_periods = st.sidebar.multiselect("Dönem seçimi", period_values, default=period_values)
     if selected_periods:
-        filtered = filtered[filtered[period_col].astype(str).isin(selected_periods)]
+        df = df[df[period_col].astype(str).isin(selected_periods)]
 
     for col, label in DASHBOARD_FILTERS:
-        vals = safe_unique(filtered, col)
+        vals = safe_unique(df, col)
         if vals:
             selected = st.sidebar.multiselect(label, vals)
             if selected:
-                filtered = filtered[filtered[col].astype(str).isin(selected)]
+                df = df[df[col].astype(str).isin(selected)]
 
-    tabs = st.tabs(["📊 Dashboard", "⛽ İstasyon", "⚖️ Karşılaştırma", "📑 P&L Statement", "🧪 Veri Kontrol"])
+    stmt = pnl_statement(df)
 
-    stmt = pnl_statement(filtered)
-    volume = get_line_value(stmt, "Volume Total")
-    gross_sales = get_line_value(stmt, "Gross Sales Total")
-    gross_margin = get_line_value(stmt, "Gross Margin")
-    op1 = get_line_value(stmt, "Process & Logistic Variable Expenses-Level OP1")
-    op2 = get_line_value(stmt, "Terminal costs -Level OP2")
-    ebitda = get_line_value(stmt, "EBITDA")
-    net_income = get_line_value(stmt, "Net Income")
-    net_income_wcc = get_line_value(stmt, "Net Income-Working Capital Cost")
+    def val(line: str) -> float:
+        if stmt.empty:
+            return 0.0
+        return float(stmt.loc[stmt["P&L Line"].eq(line), "Value"].sum())
 
-    gross_margin_pct = gross_margin / gross_sales if gross_sales else np.nan
-    ebitda_pct = ebitda / gross_sales if gross_sales else np.nan
-    net_income_pct = net_income / gross_sales if gross_sales else np.nan
-    net_income_per_volume = net_income / volume if volume else np.nan
+    total_volume = val("Volume Total")
+    gross_sales = val("Gross Sales Total")
+    gross_margin = val("Gross Margin")
+    ebitda = val("EBITDA")
+    net_income = val("Net Income")
+    net_wcc = val("Net Income-Working Capital Cost")
+
+    st.subheader("Genel Dashboard")
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Volume Total", format_number(total_volume))
+    k2.metric("Gross Sales", format_money(gross_sales, currency))
+    k3.metric("Gross Margin", format_money(gross_margin, currency), format_ratio(gross_margin / gross_sales if gross_sales else np.nan))
+    k4.metric("EBITDA", format_money(ebitda, currency), format_ratio(ebitda / gross_sales if gross_sales else np.nan))
+    k5.metric("Net Income", format_money(net_income, currency), format_ratio(net_income / gross_sales if gross_sales else np.nan))
+    k6.metric("Net Inc. / Volume", format_per_volume(net_income / total_volume if total_volume else np.nan, currency))
+
+    tabs = st.tabs(["📊 Trend", "⛽ İstasyon", "⚖️ Karşılaştırma", "📑 P&L Detay", "🧪 Veri Kontrol"])
 
     with tabs[0]:
-        st.subheader("Genel Özet")
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Volume", format_number(volume))
-        k2.metric("Gross Sales", format_money(gross_sales, currency))
-        k3.metric("Gross Margin", format_money(gross_margin, currency), format_ratio(gross_margin_pct))
-        k4.metric("EBITDA", format_money(ebitda, currency), format_ratio(ebitda_pct))
-        k5.metric("Net Income", format_money(net_income, currency), format_ratio(net_income_pct))
-        k6.metric("Net Income / Volume", format_per_volume(net_income_per_volume, currency))
+        timeline = make_wide(aggregate_long(df, [period_col]), [period_col])
+        if timeline.empty:
+            st.info("Seçili filtrelerde veri yok.")
+        else:
+            metric = st.selectbox("Trend metriği", ["Gross Sales Total", "Gross Margin", "EBITDA", "Net Income", "Net Income-Working Capital Cost"], index=3)
+            fig = px.line(timeline.sort_values(period_col), x=period_col, y=metric, markers=True, title=f"{metric} Trend")
+            fig.update_layout(height=480)
+            st.plotly_chart(fig, use_container_width=True)
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("OP1", format_money(op1, currency))
-        m2.metric("OP2", format_money(op2, currency))
-        m3.metric("Net Income - WCC", format_money(net_income_wcc, currency))
-
-        st.divider()
-        c1, c2 = st.columns([1.2, 1])
-
-        with c1:
-            st.markdown("#### Dönemsel Trend")
-            timeline = make_wide(aggregate_long(filtered, [period_col]), [period_col])
-            if not timeline.empty:
-                metric = st.selectbox(
-                    "Trend metriği",
-                    ["Gross Sales Total", "Gross Margin", "EBITDA", "Net Income", "Net Income-Working Capital Cost"],
-                    index=3,
-                )
-                fig = px.line(timeline.sort_values(period_col), x=period_col, y=metric, markers=True)
-                fig.update_layout(height=430, xaxis_title="Dönem", yaxis_title=currency)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Trend verisi yok.")
-
-        with c2:
-            st.markdown("#### Top / Bottom İstasyon")
-            station_cols = [c for c in ["İstasyon", "Name", "City", "Territory", "Territory Manager", "Area Sales Manager", "Dealer/Acenta"] if c in filtered.columns]
-            station_wide = make_wide(aggregate_long(filtered, station_cols), station_cols)
-            if not station_wide.empty:
-                rank_metric = st.selectbox("Sıralama metriği", ["Net Income", "EBITDA", "Gross Margin", "Net Income-Working Capital Cost"], index=0)
-                label = "Name" if "Name" in station_wide.columns else "İstasyon"
-                chart = pd.concat(
-                    [
-                        station_wide.sort_values(rank_metric, ascending=False).head(10).assign(Group="Top 10"),
-                        station_wide.sort_values(rank_metric, ascending=True).head(10).assign(Group="Bottom 10"),
-                    ]
-                )
-                fig = px.bar(chart, y=label, x=rank_metric, color="Group", orientation="h")
-                fig.update_layout(height=430, yaxis_title="", xaxis_title=currency)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("İstasyon verisi yok.")
-
-        st.markdown("#### İstasyon Özet Tablosu")
-        if not station_wide.empty:
+    with tabs[1]:
+        station_cols = [c for c in ["İstasyon", "Name", "City", "Territory", "Territory Manager", "Area Sales Manager", "Dealer/Acenta"] if c in df.columns]
+        station_wide = make_wide(aggregate_long(df, station_cols), station_cols)
+        if station_wide.empty:
+            st.info("İstasyon verisi bulunamadı.")
+        else:
+            label = "Name" if "Name" in station_wide.columns else "İstasyon"
+            rank_metric = st.selectbox("Sıralama metriği", ["Net Income", "EBITDA", "Gross Margin", "Net Income-Working Capital Cost"], index=0)
+            top_bottom = pd.concat([
+                station_wide.sort_values(rank_metric, ascending=False).head(10).assign(Group="Top 10"),
+                station_wide.sort_values(rank_metric, ascending=True).head(10).assign(Group="Bottom 10"),
+            ])
+            fig = px.bar(top_bottom, y=label, x=rank_metric, color="Group", orientation="h", title="Top / Bottom 10")
+            fig.update_layout(height=520)
+            st.plotly_chart(fig, use_container_width=True)
             show_cols = [c for c in station_cols + SUMMARY_LINES + ["Gross Margin %", "EBITDA %", "Net Income %", "Net Income / Volume"] if c in station_wide.columns]
             st.dataframe(style_numeric_table(station_wide[show_cols]), use_container_width=True, height=520)
             st.download_button("İstasyon özet CSV indir", download_csv(station_wide[show_cols]), "station_summary.csv", "text/csv")
 
-    with tabs[1]:
-        st.subheader("İstasyon Bazlı Analiz")
-        stations = safe_unique(filtered, "İstasyon")
-        if not stations:
-            st.info("Seçili filtrelerde istasyon yok.")
-        else:
-            selected_station = st.selectbox("İstasyon seç", stations)
-            station_df = filtered[filtered["İstasyon"].astype(str).eq(selected_station)]
-            name = station_df["Name"].dropna().astype(str).iloc[0] if "Name" in station_df.columns and not station_df["Name"].dropna().empty else selected_station
-            st.markdown(f"### {selected_station} - {name}")
-            station_stmt = pnl_statement(station_df)
-
-            s1, s2 = st.columns([1, 1])
-            with s1:
-                st.dataframe(station_stmt, use_container_width=True, height=650)
-            with s2:
-                station_timeline = make_wide(aggregate_long(station_df, [period_col]), [period_col])
-                if not station_timeline.empty:
-                    fig = px.line(
-                        station_timeline.sort_values(period_col),
-                        x=period_col,
-                        y=["Gross Margin", "EBITDA", "Net Income"],
-                        markers=True,
-                    )
-                    fig.update_layout(height=430, xaxis_title="Dönem", yaxis_title=currency)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    fig2 = px.bar(station_timeline.sort_values(period_col), x=period_col, y="Volume Total")
-                    fig2.update_layout(height=320, xaxis_title="Dönem", yaxis_title="Volume")
-                    st.plotly_chart(fig2, use_container_width=True)
-
     with tabs[2]:
-        st.subheader("Karşılaştırma")
-        compare_options = [c for c in ["İstasyon", "Name", "City", "Territory", "Territory Manager", "Area Sales Manager", "Dealer/Acenta"] if c in filtered.columns]
-        if not compare_options:
-            st.info("Karşılaştırma için kolon yok.")
+        dims = [c for c in ["City", "Territory", "Territory Manager", "Area Sales Manager", "Dealer/Acenta", "İstasyon", "Name"] if c in df.columns]
+        if not dims:
+            st.info("Karşılaştırma boyutu bulunamadı.")
         else:
-            dim = st.selectbox("Kırılım", compare_options)
-            comp = make_wide(aggregate_long(filtered, [dim]), [dim])
+            dim = st.selectbox("Karşılaştırma kırılımı", dims)
+            comp = make_wide(aggregate_long(df, [dim]), [dim])
             if comp.empty:
-                st.info("Karşılaştırma verisi yok.")
+                st.info("Veri yok.")
             else:
-                metric = st.selectbox(
-                    "Metrik",
-                    ["Volume Total", "Gross Sales Total", "Gross Margin", "Gross Margin %", "EBITDA", "EBITDA %", "Net Income", "Net Income %", "Net Income / Volume"],
-                    index=6,
-                )
-                top_n = st.slider("Gösterilecek kayıt", 5, 100, 25)
-                chart = comp.sort_values(metric, ascending=False).head(top_n)
-                fig = px.bar(chart, y=dim, x=metric, orientation="h")
-                fig.update_layout(height=650, yaxis_title="", xaxis_title=currency)
+                metric = st.selectbox("Metrik", ["Volume Total", "Gross Sales Total", "Gross Margin", "EBITDA", "Net Income", "Net Income / Volume"], index=4)
+                n = st.slider("Kayıt sayısı", 5, 100, 25)
+                fig = px.bar(comp.sort_values(metric, ascending=False).head(n), x=metric, y=dim, orientation="h", title=f"{dim} bazında {metric}")
+                fig.update_layout(height=620)
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(style_numeric_table(comp.sort_values(metric, ascending=False)), use_container_width=True, height=520)
 
     with tabs[3]:
-        st.subheader("P&L Statement")
-        st.dataframe(stmt, use_container_width=True, height=700)
+        st.dataframe(style_numeric_table(stmt), use_container_width=True, height=680)
         st.download_button("P&L statement CSV indir", download_csv(stmt), "pnl_statement.csv", "text/csv")
 
-        st.markdown("#### Kaynak kırılımı")
-        src = filtered.groupby(["Source Type", "Source File", "P&L Line"], dropna=False, as_index=False)["Value"].sum()
-        st.dataframe(src, use_container_width=True, height=360)
-
     with tabs[4]:
-        st.subheader("Veri Kontrol")
-        q1, q2, q3, q4 = st.columns(4)
-        q1.metric("Master Satır", f"{len(master):,}")
-        q2.metric("Filtre Sonrası", f"{len(filtered):,}")
-        q3.metric("İstasyon", f"{filtered['İstasyon'].nunique(dropna=True):,}" if "İstasyon" in filtered.columns else "-")
-        q4.metric("P&L Kalemi", f"{filtered['P&L Line'].nunique(dropna=True):,}" if "P&L Line" in filtered.columns else "-")
-
-        st.markdown("#### P&L Kalemleri")
-        line_counts = filtered.groupby(["P&L Line", "P&L Type"], dropna=False).agg(Row_Count=("Value", "size"), Value=("Value", "sum")).reset_index()
-        st.dataframe(line_counts.sort_values("P&L Line"), use_container_width=True, height=360)
-
-        unmapped = filtered[filtered["P&L Type"].eq("Unmapped")]
-        if not unmapped.empty:
-            st.warning("Maplenemeyen P&L satırları var. Admin kaynak dosya/mapping kontrolü yapmalı.")
-            st.dataframe(unmapped.head(500), use_container_width=True, height=300)
-
-        with st.expander("Ham normalize veri örneği"):
-            st.dataframe(filtered.head(1000), use_container_width=True, height=420)
-            st.download_button("Filtrelenmiş ham veri CSV indir", download_csv(filtered), "filtered_master_rows.csv", "text/csv")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Master satır", f"{len(master):,}")
+        c2.metric("Filtre sonrası", f"{len(df):,}")
+        c3.metric("İstasyon", f"{df['İstasyon'].nunique():,}" if "İstasyon" in df.columns else "-")
+        c4.metric("P&L satırı", f"{df['P&L Line'].nunique():,}" if "P&L Line" in df.columns else "-")
+        st.markdown("##### Kaynak dosya / P&L line özeti")
+        source_summary = df.groupby(["Source Type", "Source File", "P&L Line"], dropna=False)["Value"].sum().reset_index()
+        st.dataframe(source_summary, use_container_width=True, height=420)
+        st.markdown("##### Ham master örneği")
+        st.dataframe(df.head(1000), use_container_width=True, height=360)
 
 
 # ------------------------------------------------------------
-# Main
+# Main app
 # ------------------------------------------------------------
 
-is_admin = admin_login_ui()
-master_data = load_master_report()
+st.title("⛽ Franchise Station P&L")
+st.caption("Admin çoklu kaynak dosyaları bir kez mapler ve master P&L raporu oluşturur. Kullanıcılar sadece güncel dashboardı görür.")
 
-if is_admin:
-    mode = st.sidebar.radio("Görünüm", ["Dashboard", "Admin Paneli"], index=1)
-else:
-    mode = "Dashboard"
+manifest = load_json(MANIFEST_FILE, {})
+mapping_config = load_json(MAPPING_FILE, {"by_source_type": {}})
 
-if mode == "Admin Paneli" and is_admin:
-    render_admin_panel()
+with st.sidebar:
+    st.header("Giriş")
+    view_mode = st.radio("Mod", ["Dashboard", "Admin Panel"], index=0)
+
+if view_mode == "Admin Panel":
+    password = st.sidebar.text_input("Admin şifresi", type="password")
+    if password != ADMIN_PASSWORD:
+        st.warning("Admin paneli için şifre gir.")
+        st.stop()
+
+    st.subheader("Admin Panel — Çoklu dosya upload & mapping")
+    st.info("Önce her dosyada doğru başlık satırını seç, sonra kolonları P&L satırlarına map et. Mapping kaynak tipine göre kaydedilir; sonraki yüklemelerde otomatik gelir.")
+
+    uploaded_files = st.file_uploader("Kaynak Excel/CSV dosyalarını yükle", type=["xlsx", "xlsm", "xls", "csv"], accept_multiple_files=True)
+
+    if uploaded_files:
+        normalized_parts: List[pd.DataFrame] = []
+        dealer_parts: List[pd.DataFrame] = []
+        audit_parts: List[pd.DataFrame] = []
+        new_mapping_config = mapping_config.copy()
+        new_mapping_config.setdefault("by_source_type", {})
+        file_records = []
+
+        for i, file in enumerate(uploaded_files):
+            df, mapping, meta = mapping_ui_for_file(file, i, mapping_config)
+            if df is None:
+                continue
+            pnl_part, dealer_part, audit_part = normalize_pnl_source(
+                df=df,
+                mapping=mapping,
+                source_type=meta["source_type"],
+                source_file=meta["file_name"],
+                default_currency=meta["default_currency"],
+                sign_mode=meta["sign_mode"],
+            )
+            if not pnl_part.empty:
+                normalized_parts.append(pnl_part)
+            if not dealer_part.empty:
+                dealer_parts.append(dealer_part)
+            if not audit_part.empty:
+                audit_parts.append(audit_part)
+
+            new_mapping_config.setdefault(meta["file_name"], {})
+            new_mapping_config[meta["file_name"]] = {"sheet_name": meta.get("sheet_name"), "header_row": meta.get("header_row")}
+            new_mapping_config["by_source_type"][meta["source_type"]] = mapping
+            file_records.append({**meta, "mapped_rows": int(len(pnl_part)), "dealer_rows": int(len(dealer_part))})
+
+        st.divider()
+        st.markdown("### Mapping sonucu ön kontrol")
+        if normalized_parts:
+            preview = pd.concat(normalized_parts, ignore_index=True)
+            st.success(f"Maplenen P&L satırı: {len(preview):,}")
+            st.dataframe(preview.head(500), use_container_width=True, height=360)
+        else:
+            st.error("Henüz maplenen P&L satırı yok. ZSD50 için başlık satırını ve en az bir tutar/miktar kolonunu seçmelisin.")
+
+        if audit_parts:
+            st.warning("Aşağıdaki numerik kolonlar maplenmedi; önemliyse bir P&L satırına bağla.")
+            st.dataframe(pd.concat(audit_parts, ignore_index=True), use_container_width=True, height=320)
+
+        if st.button("✅ Master P&L raporunu oluştur / güncelle", type="primary"):
+            if not normalized_parts:
+                st.error("Master rapor oluşmadı. En az bir kaynak dosyada mapping yapılmalı.")
+            else:
+                master = pd.concat(normalized_parts, ignore_index=True)
+                dealer_master = pd.concat(dealer_parts, ignore_index=True).drop_duplicates() if dealer_parts else pd.DataFrame()
+                master = enrich_with_dealer_master(master, dealer_master)
+                master = add_calculated_lines(master)
+                master.to_pickle(MASTER_FILE)
+                save_json(MAPPING_FILE, new_mapping_config)
+                save_json(MANIFEST_FILE, {
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "rows": int(len(master)),
+                    "files": file_records,
+                })
+                st.success(f"Master rapor güncellendi. Satır: {len(master):,}")
+                st.dataframe(master.head(1000), use_container_width=True, height=420)
+    else:
+        st.info("Dosyaları yükleyince mapping ekranı açılacak.")
+
 else:
-    render_dashboard(master_data)
+    if not MASTER_FILE.exists():
+        st.warning("Henüz admin tarafından oluşturulmuş master P&L raporu yok.")
+        st.stop()
+    master_df = pd.read_pickle(MASTER_FILE)
+    if manifest:
+        st.caption(f"Son güncelleme: {manifest.get('updated_at', '-')} | Master satır: {manifest.get('rows', '-')}")
+    dashboard_ui(master_df)
